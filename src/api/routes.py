@@ -28,7 +28,7 @@ async def upload(file: UploadFile = File(...)):
     """
 
     if not file.filename.endswith('.pdf'):
-        raise HTTPExcetion(status_code = 400, detail = "Only PDF files allowed")
+        raise HTTPException(status_code=400, detail="Only PDF files allowed")
 
     # MOCK: parse, chunk, extract sections, metadata, etc.
     return {
@@ -47,7 +47,7 @@ async def upload(file: UploadFile = File(...)):
 @router.post("/query")
 async def query(
     question: str = Query(..., min_length = 3, max_length = 500),
-    top_k = Query(5, ge=1, le = 20),
+    top_k: int = Query(5, ge=1, le = 20),
     paper_ids: Optional[List[int]] = Query(None)
 ):
     """
@@ -140,4 +140,13 @@ async def analytics_popular(limit: int = 10):
             {"query": "What is transfer learning?", "count": 12},
             {"query": "Transformer vs RNN", "count": 8}
         ]
+    }
+@router.get("/health")
+async def health():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "services": {
+            "api": "running"
+        }
     }
