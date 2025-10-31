@@ -7,7 +7,7 @@ import uuid
 import shutil
 import logging
 from datetime import datetime
-from pathlib import Path  # ✅ ADD THIS
+from pathlib import Path 
 
 
 from src.models.database import Paper, Chunk, QueryHistory, Citation, QueryPaper, get_db
@@ -65,7 +65,7 @@ def _save_query_history(
         top_k=top_k,
         response_time=response_time,
         confidence=confidence,
-        paper_filter=paper_filter,  # ✅ CORRECT FIELD NAME
+        paper_filter=paper_filter,  
         user_rating=user_rating
     )
     db.add(query_history)
@@ -85,7 +85,7 @@ def _save_citations(
 ):
     """Helper to save citations from RAG result to database"""
     
-    # ✅ TRACK WHICH PAPERS WE'VE ALREADY CITED
+    # TRACK WHICH PAPERS WE'VE ALREADY CITED
     cited_papers = set()
     
     for citation_data in rag_result.get('citations', []):
@@ -102,13 +102,13 @@ def _save_citations(
             logger.warning(f"⚠️ Paper not found for citation: {paper_title}")
             continue
         
-        # ✅ SKIP IF WE ALREADY CITED THIS PAPER FOR THIS QUERY
+        # SKIP IF WE ALREADY CITED THIS PAPER FOR THIS QUERY
         if (query_id, paper_id) in cited_papers:
             logger.info(f"⊘ Citation already exists for query {query_id}, paper {paper_id}")
             continue
         
         try:
-            # ✅ Use get_or_create pattern to avoid duplicates
+            # Use get_or_create pattern to avoid duplicates
             existing = db.query(Citation).filter(
                 Citation.query_id == query_id,
                 Citation.paper_id == paper_id
@@ -142,9 +142,6 @@ def _save_citations(
 
 # ========== DOCUMENT INGESTION SYSTEM ==========
 
-
-# src/api/routes.py - FIXED UPLOAD ENDPOINT
-
 @router.post("/papers/upload")
 async def upload(
     file: UploadFile = File(...),
@@ -161,11 +158,11 @@ async def upload(
     
     logger.info(f"📄 Uploading: {file.filename}")
     
-    # ✅ EXTRACT PAPER_NAME FROM FILENAME (without extension)
+    # EXTRACT PAPER_NAME FROM FILENAME (without extension)
     paper_name = Path(file.filename).stem
     logger.info(f"📝 Paper name extracted: {paper_name}")
     
-    # ✅ CHECK FOR DUPLICATES BY BOTH paper_name AND filename
+    # CHECK FOR DUPLICATES BY BOTH paper_name AND filename
     existing_by_name = db.query(Paper).filter(Paper.paper_name == paper_name).first()
     existing_by_filename = db.query(Paper).filter(Paper.filename == file.filename).first()
     
@@ -203,8 +200,8 @@ async def upload(
         raise HTTPException(status_code=500, detail=f"PDF processing failed: {str(e)}")
     
     try:
-        # ✅ SAVE PAPER WITH PAPER_NAME AND ALL METADATA
- # ...
+        # SAVE PAPER WITH PAPER_NAME AND ALL METADATA
+ 
         paper = Paper(
             paper_name=paper_name,
             title=processed_doc.title or "Unknown",
@@ -249,9 +246,9 @@ async def upload(
                 section_name=section.name,
                 page_start=section.page_start,
                 page_end=section.page_end,
-                paper_name=paper_name,  # ✅ ADD THIS
-                section_id=section.section_id,  # ✅ ADD THIS
-                section_level=section.level  # ✅ ADD THIS
+                paper_name=paper_name, 
+                section_id=section.section_id,  
+                section_level=section.level  
             )
             
             for chunk in chunks:
@@ -261,8 +258,8 @@ async def upload(
                     text=chunk.text,
                     section=chunk.section,
                     page_number=chunk.page_number,
-                    section_id=chunk.section_id,  # ✅ ADD THIS
-                    section_level=chunk.section_level  # ✅ ADD THIS
+                    section_id=chunk.section_id,  
+                    section_level=chunk.section_level  
                 )
                 db.add(db_chunk)
                 chunk_count += 1
@@ -293,9 +290,9 @@ async def upload(
                 'text': c.text,
                 'section': c.section,
                 'page_number': c.page_number,
-                'paper_name': paper_name,  # ✅ ADD THIS
-                'section_id': c.section_id,  # ✅ ADD THIS
-                'section_level': c.section_level  # ✅ ADD THIS
+                'paper_name': paper_name,  
+                'section_id': c.section_id,  
+                'section_level': c.section_level  
             }
             for c in db_chunks
         ]
@@ -348,13 +345,13 @@ async def upload(
     
     return {
         "paper_id": paper.id,
-        "paper_name": paper_name,  # ✅ ADD THIS
+        "paper_name": paper_name, 
         "title": paper.title,
         "authors": paper.authors,
         "year": paper.year,
-        "keywords": paper.keywords,  # ✅ ADD THIS
-        "quality_score": paper.quality_score,  # ✅ ADD THIS
-        "format_type": paper.format_type,  # ✅ ADD THIS
+        "keywords": paper.keywords,  
+        "quality_score": paper.quality_score,  
+        "format_type": paper.format_type,  
         "sections_extracted": len(processed_doc.sections),
         "chunks_created": len(db_chunks),
         "pages": paper.total_pages,
@@ -389,7 +386,7 @@ async def rag_query(
         rag_pipeline = get_rag_pipeline(db)
         rag_result = rag_pipeline.generate_answer(question=question, top_k=top_k, paper_ids=paper_ids)
         
-        # ✅ CREATE PAPER_NAME MAPPING
+        # CREATE PAPER_NAME MAPPING
         paper_title_to_id_map = {}
         paper_title_to_name_map = {}
         
@@ -410,13 +407,13 @@ async def rag_query(
         
         _save_citations(db, query_id, rag_result, paper_title_to_id_map)
         
-        # ✅ UPDATE sources_used to use paper_name
+        # UPDATE sources_used to use paper_name
         rag_result['sources_used'] = list(set(
             paper_title_to_name_map.get(c.get('paper_title'), c.get('paper_title'))
             for c in rag_result.get('citations', [])
         ))
         
-        # ✅ UPDATE citations to use paper_name
+        # UPDATE citations to use paper_name
         for citation in rag_result.get('citations', []):
             paper_title = citation.get('paper_title')
             paper_name = paper_title_to_name_map.get(paper_title, paper_title)
@@ -426,7 +423,7 @@ async def rag_query(
             cache_service.set_query_cache(question, rag_result, paper_ids)
         
         rag_result['cached'] = False
-        logger.info(f"✅ Query answered in {rag_result['response_time']}s. Sources: {rag_result['sources_used']}")
+        logger.info(f"Query answered in {rag_result['response_time']}s. Sources: {rag_result['sources_used']}")
         return rag_result
         
     except Exception as e:
@@ -450,7 +447,7 @@ async def rag_query_batch(
     results = []
     rag_pipeline = get_rag_pipeline(db)
     
-    # ✅ CREATE PAPER_NAME MAPPING ONCE
+    # CREATE PAPER_NAME MAPPING ONCE
     paper_title_to_id_map = {}
     paper_title_to_name_map = {}
     all_papers = db.query(Paper).all()
@@ -473,13 +470,13 @@ async def rag_query_batch(
             
             _save_citations(db, query_id, result, paper_title_to_id_map)
             
-            # ✅ UPDATE sources_used
+            # UPDATE sources_used
             result['sources_used'] = list(set(
                 paper_title_to_name_map.get(c.get('paper_title'), c.get('paper_title'))
                 for c in result.get('citations', [])
             ))
             
-            # ✅ UPDATE citations
+            # UPDATE citations
             for citation in result.get('citations', []):
                 paper_title = citation.get('paper_title')
                 paper_name = paper_title_to_name_map.get(paper_title, paper_title)
@@ -519,7 +516,7 @@ async def list_papers(
     """List all uploaded papers with pagination and quality filtering"""
     query = db.query(Paper)
     
-    # ✅ ADD QUALITY FILTERING
+    # ADD QUALITY FILTERING
     if min_quality is not None:
         query = query.filter(Paper.quality_score >= min_quality)
     
@@ -530,14 +527,14 @@ async def list_papers(
         "papers": [
             {
                 "id": p.id,
-                "paper_name": p.paper_name,  # ✅ ADD THIS
+                "paper_name": p.paper_name, 
                 "title": p.title,
                 "authors": p.authors,
                 "year": p.year,
                 "pages": p.total_pages,
                 "chunks": p.chunk_count,
-                "quality_score": p.quality_score,  # ✅ ADD THIS
-                "keywords": p.keywords,  # ✅ ADD THIS
+                "quality_score": p.quality_score,  
+                "keywords": p.keywords,  
                 "processed": p.processed,
                 "uploaded": p.upload_date.isoformat()
             }
@@ -560,12 +557,12 @@ async def get_paper(paper_id: int, db: Session = Depends(get_db)):
     
     return {
         "id": paper.id,
-        "paper_name": paper.paper_name,  # ✅ ADD THIS
+        "paper_name": paper.paper_name,  
         "title": paper.title,
         "authors": paper.authors,
         "year": paper.year,
-        "keywords": paper.keywords,  # ✅ ADD THIS
-        "quality_score": paper.quality_score,  # ✅ ADD THIS
+        "keywords": paper.keywords,  
+        "quality_score": paper.quality_score,  
         "abstract": paper.abstract,
         "sections": paper.sections,
         "pages": paper.total_pages,
@@ -596,7 +593,7 @@ async def delete_paper(paper_id: int, db: Session = Depends(get_db)):
     
     return {
         "id": paper_id,
-        "paper_name": paper.paper_name,  # ✅ ADD THIS
+        "paper_name": paper.paper_name,  
         "status": "deleted",
         "title": paper.title
     }
@@ -620,10 +617,10 @@ async def paper_stats(paper_id: int, db: Session = Depends(get_db)):
     
     return {
         "paper_id": paper_id,
-        "paper_name": paper.paper_name,  # ✅ ADD THIS
+        "paper_name": paper.paper_name, 
         "title": paper.title,
-        "quality_score": paper.quality_score,  # ✅ ADD THIS
-        "keywords": paper.keywords,  # ✅ ADD THIS
+        "quality_score": paper.quality_score,  
+        "keywords": paper.keywords,  
         "chunks_created": paper.chunk_count,
         "times_cited": citations_count,
         "times_queried": query_count,
@@ -699,9 +696,9 @@ async def analytics_papers(db: Session = Depends(get_db)):
     
     stats = db.query(
         Paper.id,
-        Paper.paper_name,  # ✅ ADD THIS
+        Paper.paper_name,  
         Paper.title,
-        Paper.quality_score,  # ✅ ADD THIS
+        Paper.quality_score,  
         func.count(Citation.id).label('citations')
     ).outerjoin(Citation, Paper.id == Citation.paper_id).group_by(
         Paper.id
@@ -711,9 +708,9 @@ async def analytics_papers(db: Session = Depends(get_db)):
         "paper_stats": [
             {
                 "id": s[0],
-                "paper_name": s[1],  # ✅ ADD THIS
+                "paper_name": s[1],  
                 "title": s[2],
-                "quality_score": s[3],  # ✅ ADD THIS
+                "quality_score": s[3], 
                 "times_cited": s[4] or 0
             }
             for s in stats
@@ -735,7 +732,7 @@ async def analytics_performance(db: Session = Depends(get_db)):
             "avg_response_time_ms": 0,
             "avg_confidence": 0,
             "avg_user_rating": None,
-            "avg_extraction_quality": None  # ✅ ADD THIS
+            "avg_extraction_quality": None  
         }
     
     avg_time = sum(q.response_time or 0 for q in queries) / len(queries)
@@ -744,7 +741,7 @@ async def analytics_performance(db: Session = Depends(get_db)):
     rated_queries = [q for q in queries if q.user_rating is not None]
     avg_rating = sum(q.user_rating for q in rated_queries) / len(rated_queries) if rated_queries else None
     
-    # ✅ ADD EXTRACTION QUALITY
+    # ADD EXTRACTION QUALITY
     papers = db.query(Paper).all()
     avg_extraction_quality = (
         sum(p.quality_score for p in papers) / len(papers)
@@ -759,7 +756,7 @@ async def analytics_performance(db: Session = Depends(get_db)):
         "avg_confidence": round(avg_conf, 3),
         "avg_user_rating": round(avg_rating, 2) if avg_rating else None,
         "rated_responses_count": len(rated_queries),
-        "avg_extraction_quality": round(avg_extraction_quality, 3) if avg_extraction_quality else None  # ✅ ADD THIS
+        "avg_extraction_quality": round(avg_extraction_quality, 3) if avg_extraction_quality else None  
     }
 
 
@@ -772,8 +769,8 @@ async def health():
         "timestamp": datetime.utcnow().isoformat(),
         "services": {
             "api": "running",
-            "pdf_processor": "enhanced",  # ✅ UPDATED
-            "chunking": "enhanced",  # ✅ UPDATED
+            "pdf_processor": "enhanced",  
+            "chunking": "enhanced",  
             "embedding": "ready",
             "qdrant": "ready",
             "cache": "ready",
@@ -788,8 +785,8 @@ async def root():
     """Welcome message with API documentation"""
     return {
         "message": "🚀 Research Paper RAG System",
-        "version": "2.1",  # ✅ UPDATED
-        "features_enhanced": [  # ✅ ADD THIS
+        "version": "2.1", 
+        "features_enhanced": [  
             "Paper name extraction from PDF filenames",
             "Quality score tracking for extraction accuracy",
             "Automatic keywords and citation extraction",
@@ -806,7 +803,7 @@ async def root():
                 "batch_rag_query": "POST /api/query/batch"
             },
             "paper_management": {
-                "list_papers": "GET /api/papers (with quality filter)",  # ✅ UPDATED
+                "list_papers": "GET /api/papers (with quality filter)",  
                 "get_paper_details": "GET /api/papers/{paper_id}",
                 "delete_paper": "DELETE /api/papers/{paper_id}",
                 "paper_statistics": "GET /api/papers/{paper_id}/stats"

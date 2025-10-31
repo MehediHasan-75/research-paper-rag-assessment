@@ -83,9 +83,9 @@ class IntelligentChunker:
                      section_name: str, 
                      page_start: int, 
                      page_end: int,
-                     paper_name: Optional[str] = None,  # ✅ ADD THIS
-                     section_id: Optional[str] = None,  # ✅ ADD THIS
-                     section_level: int = 0  # ✅ ADD THIS
+                     paper_name: Optional[str] = None,  
+                     section_id: Optional[str] = None,  
+                     section_level: int = 0  
                      ) -> List[Chunk]:
         """
         Create optimally-sized chunks from a section with paper_name tracking
@@ -125,9 +125,9 @@ class IntelligentChunker:
                                 'is_partial_sentence': True,
                                 'warning': 'sentence_too_long'
                             },
-                            paper_name=paper_name,  # ✅ ADD THIS
-                            section_id=section_id,  # ✅ ADD THIS
-                            section_level=section_level  # ✅ ADD THIS
+                            paper_name=paper_name,  
+                            section_id=section_id,  
+                            section_level=section_level  
                         ))
                         chunk_index += 1
                 else:
@@ -141,9 +141,9 @@ class IntelligentChunker:
                             'is_partial_sentence': True,
                             'warning': 'long_sentence_no_tokenizer'
                         },
-                        paper_name=paper_name,  # ✅ ADD THIS
-                        section_id=section_id,  # ✅ ADD THIS
-                        section_level=section_level  # ✅ ADD THIS
+                        paper_name=paper_name,  
+                        section_id=section_id,  
+                        section_level=section_level  
                     ))
                     chunk_index += 1
                 continue
@@ -160,9 +160,9 @@ class IntelligentChunker:
                         'sentence_count': len(current_chunk),
                         'is_complete': True
                     },
-                    paper_name=paper_name,  # ✅ ADD THIS
-                    section_id=section_id,  # ✅ ADD THIS
-                    section_level=section_level  # ✅ ADD THIS
+                    paper_name=paper_name,  
+                    section_id=section_id,  
+                    section_level=section_level  
                 ))
                 
                 overlap_sentences = []
@@ -194,16 +194,16 @@ class IntelligentChunker:
                     'sentence_count': len(current_chunk),
                     'is_final': True
                 },
-                paper_name=paper_name,  # ✅ ADD THIS
-                section_id=section_id,  # ✅ ADD THIS
-                section_level=section_level  # ✅ ADD THIS
+                paper_name=paper_name,  
+                section_id=section_id,  
+                section_level=section_level 
             ))
         
         avg_tokens = sum(c.metadata['token_count'] for c in chunks) / len(chunks) if chunks else 0
         logger.info(
             f"Created {len(chunks)} chunks from '{section_name}' "
-            f"(avg {avg_tokens:.0f} tokens/chunk) | "  # ✅ ADD THIS
-            f"paper: {paper_name} | section_id: {section_id}"  # ✅ ADD THIS
+            f"(avg {avg_tokens:.0f} tokens/chunk) | "  
+            f"paper: {paper_name} | section_id: {section_id}"  
         )
         
         return chunks

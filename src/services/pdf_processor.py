@@ -34,7 +34,7 @@ class Citation:
 class ProcessedDocument:
     """Complete processed document with metadata"""
     title: str
-    paper_name: str  # ✅ NEW: PDF filename as paper name
+    paper_name: str  
     authors: List[str]
     year: int
     abstract: str
@@ -94,7 +94,7 @@ class EnhancedTextCleaner:
         text = re.sub(r'\n\n+', '\n\n', text)
         
         # Stage 6: Fix common OCR errors
-        text = re.sub(r'(\d)\s+([ivxlcm])\b', r'\1\2', text)  # Fix spacing in Roman numerals
+        text = re.sub(r'(\d)\s+([ivxlcm])\b', r'\1\2', text)  
         
         return text
     
