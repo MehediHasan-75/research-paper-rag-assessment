@@ -1,11 +1,9 @@
-# test_cache_service.py (with path fix)
 import pytest
 import sys
 from pathlib import Path
 from unittest.mock import Mock, patch
 import json
 
-# Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.services.cache_service import CacheService
@@ -92,9 +90,17 @@ class TestCacheService:
     
     def test_clear_cache(self, cache_service):
         """Test clearing cache"""
+        # FIXED: Mock keys() to return a proper list (not Mock)
+        cache_service.redis.keys.return_value = [b'query:1', b'query:2', b'query:3']
+        
+        # Call clear
         cache_service.clear_query_cache()
         
-        cache_service.redis.delete.assert_called()
+        # Verify keys() was called with correct pattern
+        cache_service.redis.keys.assert_called_once_with("query:*")
+        
+        # Verify delete was called with the keys
+        cache_service.redis.delete.assert_called_once()
     
     def test_cache_expiration(self, cache_service):
         """Test cache TTL is set correctly"""
@@ -135,3 +141,8 @@ class TestCacheService:
         assert result is not None
         assert len(result['citations']) == 2
         assert result['metadata']['confidence'] == 0.95
+    
+    def test_clear_cache_with_no_keys(self, cache_service):
+        """Test clearing cache when no keys exist"""
+        # Return empty list
+        cache_service.redis.keys

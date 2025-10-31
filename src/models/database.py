@@ -88,7 +88,7 @@ class Paper(Base):
                 return None  # Return None instead of raising error
         
         return value
-    
+
     def __repr__(self):
         return f"<Paper(id={self.id}, paper_name={self.paper_name}, quality={self.quality_score:.2f})>"
 

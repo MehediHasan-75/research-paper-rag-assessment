@@ -63,7 +63,7 @@ class TestPaperModel:
     def test_quality_score_none_handling(self):
         """Test quality_score None is converted to 0.0"""
         paper = Paper(
-            paper_name="test",
+            paper_name="test1",
             title="Test",
             filename="test.pdf",
             file_path="/test.pdf"

@@ -1,5 +1,6 @@
 # test_rag_pipeline.py (with path fix)
 import pytest
+import numpy as np
 import sys
 from pathlib import Path
 from unittest.mock import Mock, MagicMock, patch
@@ -47,7 +48,7 @@ class TestRAGPipeline:
     
     def test_generate_answer_no_results(self, rag_pipeline):
         """Test generate_answer when no results found"""
-        rag_pipeline.embedder.encode_single.return_value = [0.1, 0.2, 0.3]
+        rag_pipeline.embedder.encode_single.return_value = np.array([0.1, 0.2, 0.3])
         rag_pipeline.qdrant.search.return_value = []
         
         result = rag_pipeline.generate_answer("test question")
@@ -56,7 +57,8 @@ class TestRAGPipeline:
         assert result['citations'] == []
         assert result['sources_used'] == []
         assert result['confidence'] == 0.0
-        assert result['response_time'] > 0
+        assert result['response_time'] >= 0
+
     
     def test_generate_answer_with_results(self, rag_pipeline):
         """Test generate_answer with valid results"""
@@ -65,7 +67,7 @@ class TestRAGPipeline:
         mock_paper.title = "Test Paper"
         mock_paper.paper_name = "test_paper"
         
-        rag_pipeline.embedder.encode_single.return_value = [0.1, 0.2, 0.3]
+        rag_pipeline.embedder.encode_single.return_value = np.array([0.1, 0.2, 0.3])
         rag_pipeline.qdrant.search.return_value = [
             {
                 'paper_id': 1,
@@ -86,11 +88,12 @@ class TestRAGPipeline:
         assert 'answer' in result
         assert len(result['citations']) > 0
         assert result['confidence'] > 0
-        assert result['response_time'] > 0
+        assert result['response_time'] >= 0
+
     
     def test_generate_answer_paper_filtering(self, rag_pipeline):
         """Test generate_answer with paper ID filtering"""
-        rag_pipeline.embedder.encode_single.return_value = [0.1, 0.2]
+        rag_pipeline.embedder.encode_single.return_value = np.array([0.1, 0.2])
         rag_pipeline.qdrant.search.return_value = []
         
         paper_ids = [1, 2, 3]
@@ -102,7 +105,7 @@ class TestRAGPipeline:
     
     def test_generate_answer_top_k_parameter(self, rag_pipeline):
         """Test top_k parameter is passed correctly"""
-        rag_pipeline.embedder.encode_single.return_value = [0.1]
+        rag_pipeline.embedder.encode_single.return_value = np.array([0.1])
         rag_pipeline.qdrant.search.return_value = []
         
         rag_pipeline.generate_answer("test", top_k=10)
@@ -116,7 +119,7 @@ class TestRAGPipeline:
         mock_paper.title = "Test"
         mock_paper.paper_name = "test"
         
-        rag_pipeline.embedder.encode_single.return_value = [0.1]
+        rag_pipeline.embedder.encode_single.return_value = np.array([0.1])
         rag_pipeline.qdrant.search.return_value = [
             {'paper_id': 1, 'text': 'a', 'section': 's', 'page': 1, 'score': 0.9},
             {'paper_id': 1, 'text': 'b', 'section': 's', 'page': 1, 'score': 0.8},

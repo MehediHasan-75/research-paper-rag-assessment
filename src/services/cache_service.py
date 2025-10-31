@@ -63,6 +63,24 @@ class CacheService:
         """Generate cache key from question and paper IDs"""
         key_str = f"{question}:{sorted(paper_ids) if paper_ids else 'all'}"
         return f"query:{hashlib.md5(key_str.encode()).hexdigest()}"
+    def clear_query_cache(self, pattern: str = "query:*"):
+        """
+        Clear cached queries matching pattern.
+        
+        Args:
+            pattern: Redis key pattern to clear (default: all query cache)
+        """
+        if not self.redis:
+            logger.warning("Redis not available, cannot clear cache")
+            return
+        
+        try:
+            keys = self.redis.keys(pattern)
+            if keys:
+                self.redis.delete(*keys)
+                logger.info(f"Cleared {len(keys)} cache entries")
+        except Exception as e:
+            logger.error(f"Failed to clear cache: {e}")
 
 
 # ✅ Global instance for easy import

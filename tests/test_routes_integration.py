@@ -31,10 +31,6 @@ def mock_services():
 class TestPaperUploadEndpoint:
     """Test suite for paper upload endpoint"""
     
-    def test_upload_valid_pdf(self, mock_db, mock_services):
-        """Test uploading valid PDF"""
-        with patch('src.routes.pdf_processor', mock_services['pdf_processor']):
-            pass
     
     def test_upload_invalid_file_type(self, mock_db):
         """Test uploading non-PDF file"""

@@ -4,26 +4,26 @@ Initial Database Setup Script
 Run this after cloning the repository to initialize the database with all tables and indexes.
 
 Usage:
-    python initdb.py              # Create tables only
-    python initdb.py --reset      # Drop and recreate all tables
-    python initdb.py --migrate    # Run migrations and updates
-    python initdb.py --check      # Verify database integrity
-    python initdb.py --seed       # Seed with sample data
+    python -m src.init_db              # Create tables only
+    python -m src.init_db --reset      # Drop and recreate all tables
+    python -m src.init_db --migrate    # Run migrations and updates
+    python -m src.init_db --check      # Verify database integrity
+    python -m src.init_db --seed       # Seed with sample data
+    python -m src.init_db --all        # Do everything
 """
 
 import sys
-import os
 import argparse
 import logging
 from pathlib import Path
 from datetime import datetime
 
-# Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent))
+# Add parent directory to path for proper module resolution
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.models.database import (
     Base, engine, SessionLocal, Paper, Chunk, QueryHistory, Citation, 
-    PaperArchive, initdb, check_database_integrity, migrate_to_enhanced_schema
+    PaperArchive, init_db, check_database_integrity, migrate_to_enhanced_schema
 )
 from src.config import settings
 
@@ -33,24 +33,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-
-def create_tables():
-    """Create all database tables and indexes."""
-    logger.info("=" * 60)
-    logger.info("Creating database tables and indexes...")
-    logger.info("=" * 60)
-    
-    try:
-        Base.metadata.create_all(bind=engine)
-        logger.info("✓ All tables created successfully!")
-        logger.info(f"Database URL: {settings.DATABASEURL}")
-        logger.info(f"Pool size: {settings.DBPOOLSIZE}")
-        logger.info(f"Max overflow: {settings.DBMAXOVERFLOW}")
-        return True
-    except Exception as e:
-        logger.error(f"✗ Failed to create tables: {e}")
-        return False
 
 
 def drop_tables():
@@ -81,11 +63,13 @@ def reset_database():
     if not drop_tables():
         return False
     
-    if not create_tables():
+    try:
+        init_db()
+        logger.info("✓ Database reset complete!")
+        return True
+    except Exception as e:
+        logger.error(f"✗ Failed to reset database: {e}")
         return False
-    
-    logger.info("✓ Database reset complete!")
-    return True
 
 
 def verify_tables():
@@ -101,17 +85,18 @@ def verify_tables():
         tables_to_check = {
             'papers': Paper,
             'chunks': Chunk,
-            'queryhistory': QueryHistory,
+            'query_history': QueryHistory,
             'citations': Citation,
-            'paperarchive': PaperArchive
+            'paper_archive': PaperArchive
         }
         
         for table_name, model in tables_to_check.items():
             try:
                 count = db.query(model).count()
-                logger.info(f"✓ Table '{table_name}': OK (0 rows)")
+                logger.info(f"✓ Table '{table_name}': OK ({count} rows)")
             except Exception as e:
                 logger.error(f"✗ Table '{table_name}': MISSING or ERROR - {e}")
+                db.close()
                 return False
         
         db.close()
@@ -123,24 +108,15 @@ def verify_tables():
         return False
 
 
-def check_integrity():
-    """Check database integrity."""
+def run_checks():
+    """Run database integrity checks."""
     logger.info("=" * 60)
     logger.info("Checking database integrity...")
     logger.info("=" * 60)
     
     try:
-        db = SessionLocal()
-        is_valid = check_database_integrity()
-        db.close()
-        
-        if is_valid:
-            logger.info("✓ Database integrity check passed!")
-            return True
-        else:
-            logger.warning("✗ Database integrity issues detected!")
-            return False
-            
+        result = check_database_integrity()
+        return result
     except Exception as e:
         logger.error(f"✗ Integrity check failed: {e}")
         return False
@@ -295,13 +271,14 @@ def main():
         description="Initialize Research Paper RAG Database",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  python initdb.py              # Create tables
-  python initdb.py --reset      # Drop and recreate tables
-  python initdb.py --migrate    # Run migrations
-  python initdb.py --check      # Check integrity
-  python initdb.py --seed       # Seed sample data
-  python initdb.py --all        # Do everything (create, migrate, check, seed)
+Examples (run from project root):
+  python -m src.init_db              # Create tables (default)
+  python -m src.init_db --reset      # Drop and recreate tables
+  python -m src.init_db --migrate    # Run migrations
+  python -m src.init_db --check      # Check integrity
+  python -m src.init_db --seed       # Seed sample data
+  python -m src.init_db --verify     # Verify tables
+  python -m src.init_db --all        # Do everything (create, migrate, check, seed)
         """
     )
     
@@ -340,6 +317,7 @@ Examples:
     
     logger.info("Research Paper RAG - Database Initialization")
     logger.info(f"Timestamp: {datetime.now().isoformat()}")
+    logger.info(f"Database URL: {settings.DATABASE_URL}")
     logger.info("")
     
     success = True
@@ -353,8 +331,13 @@ Examples:
     
     # Default: create tables if no args
     if not any([args.reset, args.migrate, args.check, args.seed, args.verify]):
-        logger.info("Running default initialization...")
-        success = create_tables() and verify_tables()
+        logger.info("Running default initialization (create tables)...")
+        try:
+            init_db()
+            success = success and verify_tables()
+        except Exception as e:
+            logger.error(f"✗ Failed to create tables: {e}")
+            success = False
     else:
         # Reset database
         if args.reset:
@@ -362,7 +345,12 @@ Examples:
         
         # Create tables if not reset
         if not args.reset and (args.migrate or args.check or args.seed or args.verify):
-            success = success and create_tables()
+            try:
+                init_db()
+                success = True
+            except Exception as e:
+                logger.error(f"✗ Failed to create tables: {e}")
+                success = False
         
         # Verify tables
         if args.verify:
@@ -374,7 +362,7 @@ Examples:
         
         # Check integrity
         if args.check:
-            success = success and check_integrity()
+            success = success and run_checks()
         
         # Seed data
         if args.seed:

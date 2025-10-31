@@ -1,15 +1,15 @@
-# tests/test_pdf_processor_real.py
 # Tests with REAL papers from sample_papers directory
 
 import pytest
 import os
 from pathlib import Path
-from src.services.pdf_processor import PDFProcessor, ProcessedDocument
+from src.services.pdf_processor import PDFProcessorEnhanced, ProcessedDocument
 
 @pytest.fixture
 def processor():
     """Create processor"""
-    return PDFProcessor()
+    return PDFProcessorEnhanced()
+
 
 @pytest.fixture
 def papers_dir():
@@ -103,7 +103,7 @@ def test_all_papers_have_metadata(processor, papers_dir):
     pdfs = sorted(papers_dir.glob("paper_*.pdf"))
     
     for pdf_path in pdfs:
-        title, authors, year = processor.extract_metadata(str(pdf_path))
+        title, authors, year, keywords = processor.extract_metadata(str(pdf_path))
         
         assert title is not None
         assert title != "Unknown"
