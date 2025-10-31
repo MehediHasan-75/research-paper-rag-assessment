@@ -1,57 +1,137 @@
+# test_cache_service.py (with path fix)
 import pytest
+import sys
+from pathlib import Path
 from unittest.mock import Mock, patch
+import json
+
+# Add parent directory to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from src.services.cache_service import CacheService
 
-@pytest.fixture
-def cache_service():
-    """Create cache service with mocked Redis"""
-    with patch('src.services.cache_service.redis.Redis'):
-        service = CacheService()
-        service.redis = Mock()
-        return service
 
-# ========== CACHING TESTS ==========
-
-def test_cache_set_and_get(cache_service):
-    """Test setting and getting cache"""
-    result = {"answer": "test", "citations": []}
+class TestCacheService:
+    """Test suite for CacheService"""
     
-    cache_service.redis.get.return_value = None
-    cache_service.set_query_cache("test query", result)
+    @pytest.fixture
+    def cache_service(self):
+        """Create CacheService with mock Redis"""
+        with patch('src.services.cache_service.redis.Redis'):
+            service = CacheService(host="localhost", port=6379, ttl=3600)
+            service.redis = Mock()
+            return service
     
-    assert cache_service.redis.setex.called
-
-def test_cache_hit(cache_service):
-    """Test cache hit"""
-    import json
-    result = {"answer": "test", "citations": []}
+    def test_initialization_success(self):
+        """Test successful cache initialization"""
+        with patch('src.services.cache_service.redis.Redis') as mock_redis:
+            mock_instance = Mock()
+            mock_redis.return_value = mock_instance
+            mock_instance.ping.return_value = True
+            
+            service = CacheService()
+            assert service.redis is not None
+            assert service.ttl == 3600
     
-    cache_service.redis.get.return_value = json.dumps(result)
-    cached = cache_service.get_query_cache("test query")
+    def test_initialization_failure(self):
+        """Test cache initialization with Redis unavailable"""
+        with patch('src.services.cache_service.redis.Redis') as mock_redis:
+            mock_redis.side_effect = Exception("Connection failed")
+            
+            service = CacheService()
+            assert service.redis is None
     
-    assert cached is not None
-
-def test_cache_miss(cache_service):
-    """Test cache miss"""
-    cache_service.redis.get.return_value = None
-    cached = cache_service.get_query_cache("test query")
+    def test_get_query_cache_hit(self, cache_service):
+        """Test cache hit"""
+        cached_result = {"answer": "test", "confidence": 0.9}
+        cache_service.redis.get.return_value = json.dumps(cached_result)
+        
+        result = cache_service.get_query_cache("test question")
+        
+        assert result is not None
+        assert result['answer'] == "test"
     
-    assert cached is None
-
-def test_cache_with_paper_ids(cache_service):
-    """Test caching with specific paper IDs"""
-    result = {"answer": "test"}
-    paper_ids = [1, 2, 3]
+    def test_get_query_cache_miss(self, cache_service):
+        """Test cache miss"""
+        cache_service.redis.get.return_value = None
+        
+        result = cache_service.get_query_cache("test question")
+        
+        assert result is None
     
-    cache_service.set_query_cache("query", result, paper_ids=paper_ids)
+    def test_set_query_cache(self, cache_service):
+        """Test setting query cache"""
+        result_data = {"answer": "test", "confidence": 0.9}
+        
+        cache_service.set_query_cache("test question", result_data)
+        
+        cache_service.redis.setex.assert_called_once()
+        call_args = cache_service.redis.setex.call_args
+        assert call_args[0][1] == 3600  # TTL
     
-    assert cache_service.redis.setex.called
-
-def test_redis_unavailable(cache_service):
-    """Test graceful fallback when Redis is unavailable"""
-    cache_service.redis = None
+    def test_cache_with_paper_filter(self, cache_service):
+        """Test cache with paper ID filter"""
+        cache_service.redis.get.return_value = None
+        
+        paper_ids = [1, 2, 3]
+        cache_service.get_query_cache("test", paper_ids=paper_ids)
+        
+        # Should generate different key for different filters
+        key = cache_service._generate_key("test", paper_ids)
+        assert isinstance(key, str)
+        assert key.startswith("query:")
     
-    cache_service.set_query_cache("query", {})
-    cached = cache_service.get_query_cache("query")
+    def test_cache_disabled_when_redis_unavailable(self):
+        """Test cache gracefully disabled when Redis unavailable"""
+        with patch('src.services.cache_service.redis.Redis') as mock_redis:
+            mock_redis.side_effect = Exception("Redis not available")
+            service = CacheService()
+            
+            result = service.get_query_cache("test")
+            assert result is None
     
-    assert cached is None
+    def test_clear_cache(self, cache_service):
+        """Test clearing cache"""
+        cache_service.clear_query_cache()
+        
+        cache_service.redis.delete.assert_called()
+    
+    def test_cache_expiration(self, cache_service):
+        """Test cache TTL is set correctly"""
+        service = CacheService(ttl=1800)
+        assert service.ttl == 1800
+    
+    def test_cache_key_generation(self, cache_service):
+        """Test cache key generation"""
+        key1 = cache_service._generate_key("question1", None)
+        key2 = cache_service._generate_key("question2", None)
+        
+        assert key1 != key2
+        assert isinstance(key1, str)
+        assert isinstance(key2, str)
+    
+    def test_invalid_json_in_cache(self, cache_service):
+        """Test handling of invalid JSON in cache"""
+        cache_service.redis.get.return_value = "invalid json {{"
+        
+        result = cache_service.get_query_cache("test")
+        
+        assert result is None
+    
+    def test_cache_with_complex_data(self, cache_service):
+        """Test caching complex nested data structures"""
+        complex_data = {
+            "answer": "Complex answer",
+            "citations": [
+                {"paper_id": 1, "section": "Introduction"},
+                {"paper_id": 2, "section": "Methods"}
+            ],
+            "metadata": {"confidence": 0.95, "sources": 2}
+        }
+        cache_service.redis.get.return_value = json.dumps(complex_data)
+        
+        result = cache_service.get_query_cache("complex query")
+        
+        assert result is not None
+        assert len(result['citations']) == 2
+        assert result['metadata']['confidence'] == 0.95
