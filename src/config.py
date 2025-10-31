@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     MAX_UPLOAD_SIZE: int = 50
     UPLOAD_DIR: str = "./uploads"
     
+    API_WORKERS: int = 1
+
     class Config:
         env_file = ".env"
         case_sensitive = True
