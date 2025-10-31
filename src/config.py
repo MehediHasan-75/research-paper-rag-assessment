@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     UPLOAD_DIR: str = "./uploads"
     
     API_WORKERS: int = 1
+    MAX_WORKERS: int = 1
+    QUERY_CACHE_ENABLED: bool = True
+
+    # Auth tokens (optional)
+    HUGGING_FACE_HUB_TOKEN: str | None = None
 
     class Config:
         env_file = ".env"
