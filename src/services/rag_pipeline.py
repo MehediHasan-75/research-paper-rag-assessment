@@ -1,8 +1,8 @@
-# src/services/rag_pipeline.py
 import ollama
 from typing import List, Dict, Optional
 import time
 from src.models.database import Paper
+
 
 class RAGPipeline:
     def __init__(self, qdrant_service, embedding_service, db_session, 
@@ -14,7 +14,7 @@ class RAGPipeline:
     
     def generate_answer(self, question: str, top_k: int = 5, 
                        paper_ids: Optional[List[int]] = None) -> Dict:
-        """Main RAG pipeline"""
+        """Main RAG pipeline with paper_name tracking"""
         start_time = time.time()
         
         # 1. Encode query
@@ -40,8 +40,9 @@ class RAGPipeline:
         context_parts = []
         for i, result in enumerate(search_results, 1):
             paper = self.db.query(Paper).filter(Paper.id == result['paper_id']).first()
+            # ✅ INCLUDE PAPER_NAME IN CONTEXT
             context_parts.append(
-                f"[Source {i}] From '{paper.title}', {result['section']} (Page {result['page']}):\n"
+                f"[Source {i}] From '{paper.title}' (paper_name: {paper.paper_name}), {result['section']} (Page {result['page']}):\n"
                 f"{result['text']}\n"
             )
         
@@ -50,16 +51,20 @@ class RAGPipeline:
         # 4. Generate answer with LLM
         prompt = f"""You are a research assistant helping analyze academic papers.
 
+
 Context from research papers:
 {context}
 
+
 Question: {question}
+
 
 Instructions:
 - Provide a clear, accurate answer based ONLY on the context provided
 - Cite specific sources using [Source N] notation
 - If the context doesn't fully answer the question, acknowledge what's missing
 - Be concise but comprehensive
+
 
 Answer:"""
         
@@ -70,12 +75,13 @@ Answer:"""
         
         answer = response['message']['content']
         
-        # 5. Build citations
+        # 5. Build citations with paper_name
         citations = []
         for result in search_results:
             paper = self.db.query(Paper).filter(Paper.id == result['paper_id']).first()
             citations.append({
                 'paper_title': paper.title,
+                'paper_name': paper.paper_name,  # ✅ ADD THIS
                 'section': result['section'],
                 'page': result['page'],
                 'relevance_score': round(result['score'], 3)

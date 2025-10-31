@@ -1,39 +1,32 @@
-from typing import List, Dict
-from dataclasses import dataclass
+from typing import List, Dict, Optional
+from dataclasses import dataclass, field
 from transformers import AutoTokenizer
 import re
 import logging
 import os
 from src.config import settings
 
+
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class Chunk:
-    """Represents a text chunk with metadata"""
+    """Represents a text chunk with enhanced metadata"""
     text: str
     section: str
     page_number: int
     chunk_index: int
-    metadata: Dict
+    metadata: Dict = field(default_factory=dict)
+    
+    paper_name: Optional[str] = None  # From PDF filename
+    section_id: Optional[str] = None  # e.g., "2.1"
+    section_level: int = 0  # 0=main, 1=sub, 2=subsub
+
 
 class IntelligentChunker:
     """
-    Production-grade intelligent chunking for research papers
-    
-    Strategy:
-    - 450 tokens per chunk (safe buffer below 512 limit)
-    - 50 token overlap (context preservation)
-    - Sentence-aware (semantic boundaries)
-    - Citation-aware (doesn't break [1.2.3] format)
-    - Real tokenizer for accuracy (not word approximation)
-    - Handles long sentences (>512 tokens)
-    
-    Why optimal:
-    - Sentence-transformers work best at 256-512 tokens
-    - LLM context size safe
-    - Preserves semantic meaning
-    - Academic paper friendly
+    Production-grade intelligent chunking for research papers with paper_name tracking
     """
     
     def __init__(self, 
@@ -43,40 +36,41 @@ class IntelligentChunker:
         self.chunk_size = chunk_size
         self.overlap = overlap
         
-        # ✅ Respect offline mode: skip remote tokenizer load
         if os.getenv('HF_HUB_OFFLINE') == '1' or os.getenv('TRANSFORMERS_OFFLINE') == '1':
             self.tokenizer = None
             logger.info("Offline mode enabled; using word-based token estimation.")
         else:
-            # ✅ Use REAL tokenizer for accurate token counting
             try:
-                normalized_name = model_name.replace('sentence-transformers/', '')
-                self.tokenizer = AutoTokenizer.from_pretrained(normalized_name)
+                hf_token = os.getenv('HUGGING_FACE_HUB_TOKEN') or os.getenv('HUGGINGFACE_HUB_TOKEN')
+                try:
+                    # Prefer full repo id first
+                    self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
+                except TypeError:
+                    # Older transformers versions use use_auth_token
+                    self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_auth_token=hf_token)
                 logger.info(f"✅ Loaded tokenizer: {model_name}")
             except Exception as e:
-                logger.warning(f"Failed to load tokenizer: {e}. Falling back to word estimation.")
-                self.tokenizer = None
+                # Fallback to normalized name if the full repo id isn't a tokenizer repo
+                try:
+                    normalized_name = model_name.replace('sentence-transformers/', '')
+                    try:
+                        self.tokenizer = AutoTokenizer.from_pretrained(normalized_name, token=hf_token)
+                    except TypeError:
+                        self.tokenizer = AutoTokenizer.from_pretrained(normalized_name, use_auth_token=hf_token)
+                    logger.info(f"✅ Loaded tokenizer (fallback): {normalized_name}")
+                except Exception:
+                    logger.warning(f"Failed to load tokenizer: {e}. Falling back to word estimation.")
+                    self.tokenizer = None
     
     def estimate_tokens(self, text: str) -> int:
-        """
-        Accurate token estimation
-        Uses real tokenizer if available, fallback to 1.3x multiplier
-        """
+        """Accurate token estimation"""
         if self.tokenizer:
             return len(self.tokenizer.encode(text, add_special_tokens=False))
         else:
-            # Fallback: ~1.3 tokens per word (conservative)
             return int(len(text.split()) * 1.3)
     
     def split_into_sentences(self, text: str) -> List[str]:
-        """
-        Split text into sentences, preserving academic formatting:
-        - Citations [1.2.3]
-        - Numbers 2.5, 3.14
-        - Abbreviations et al., Fig., Tab., Eq.
-        - Common patterns Dr., Prof., Inc.
-        """
-        # ✅ Enhanced regex for academic papers
+        """Split text into sentences, preserving academic formatting"""
         sentences = re.split(
             r'(?<!\d)\.(?!\d)(?!\s*al\.)(?!\s*Fig\.)(?!\s*Tab\.)(?!\s*Eq\.)'
             r'(?!\s*Dr\.)(?!\s*Prof\.)(?!\s*Inc\.)(?!\s*Ltd\.)(?!\s*etc\.)\s+',
@@ -88,16 +82,22 @@ class IntelligentChunker:
                      section_text: str, 
                      section_name: str, 
                      page_start: int, 
-                     page_end: int) -> List[Chunk]:
+                     page_end: int,
+                     paper_name: Optional[str] = None,  # ✅ ADD THIS
+                     section_id: Optional[str] = None,  # ✅ ADD THIS
+                     section_level: int = 0  # ✅ ADD THIS
+                     ) -> List[Chunk]:
         """
-        Create optimally-sized chunks from a section
+        Create optimally-sized chunks from a section with paper_name tracking
         
-        Process:
-        1. Split into sentences (semantic boundaries)
-        2. Group sentences until chunk_size reached
-        3. Add overlap for context preservation
-        4. Handle edge cases (long sentences)
-        5. Track metadata
+        Args:
+            section_text: Text to chunk
+            section_name: Section name
+            page_start: Starting page
+            page_end: Ending page
+            paper_name: ✅ NEW: PDF filename (e.g., "lwe_optimization_2024")
+            section_id: ✅ NEW: Section numbering (e.g., "2.1")
+            section_level: ✅ NEW: Hierarchy level (0=main, 1=sub)
         """
         sentences = self.split_into_sentences(section_text)
         chunks = []
@@ -108,10 +108,8 @@ class IntelligentChunker:
         for sentence in sentences:
             sentence_tokens = self.estimate_tokens(sentence)
             
-            # ✅ EDGE CASE: Single sentence exceeds limit
-            # ✅ CORRECT (fixed)
             if sentence_tokens > self.chunk_size:
-                logger.warning(f"Long sentence...")
+                logger.warning(f"Long sentence ({sentence_tokens} tokens) in {section_name}")
                 if self.tokenizer:
                     tokens = self.tokenizer.encode(sentence, add_special_tokens=False)
                     for i in range(0, len(tokens), self.chunk_size - self.overlap):
@@ -126,11 +124,13 @@ class IntelligentChunker:
                                 'token_count': len(chunk_tokens),
                                 'is_partial_sentence': True,
                                 'warning': 'sentence_too_long'
-                            }
+                            },
+                            paper_name=paper_name,  # ✅ ADD THIS
+                            section_id=section_id,  # ✅ ADD THIS
+                            section_level=section_level  # ✅ ADD THIS
                         ))
                         chunk_index += 1
                 else:
-                    # If no tokenizer, just add the whole sentence
                     chunks.append(Chunk(
                         text=sentence,
                         section=section_name,
@@ -140,15 +140,15 @@ class IntelligentChunker:
                             'token_count': sentence_tokens,
                             'is_partial_sentence': True,
                             'warning': 'long_sentence_no_tokenizer'
-                        }
+                        },
+                        paper_name=paper_name,  # ✅ ADD THIS
+                        section_id=section_id,  # ✅ ADD THIS
+                        section_level=section_level  # ✅ ADD THIS
                     ))
                     chunk_index += 1
-                continue  # ✅ NOW OK: we already added chunks above
-
+                continue
             
-            # ✅ NORMAL CHUNKING: Group sentences
             if current_tokens + sentence_tokens > self.chunk_size and current_chunk:
-                # Save current chunk
                 chunk_text = ' '.join(current_chunk)
                 chunks.append(Chunk(
                     text=chunk_text,
@@ -159,11 +159,12 @@ class IntelligentChunker:
                         'token_count': current_tokens,
                         'sentence_count': len(current_chunk),
                         'is_complete': True
-                    }
+                    },
+                    paper_name=paper_name,  # ✅ ADD THIS
+                    section_id=section_id,  # ✅ ADD THIS
+                    section_level=section_level  # ✅ ADD THIS
                 ))
                 
-                # ✅ Start new chunk with SMART overlap
-                # Calculate overlap by sentences, not fixed count
                 overlap_sentences = []
                 overlap_tokens = 0
                 for s in reversed(current_chunk):
@@ -177,13 +178,10 @@ class IntelligentChunker:
                 current_chunk = overlap_sentences + [sentence]
                 current_tokens = sum(self.estimate_tokens(s) for s in current_chunk)
                 chunk_index += 1
-            
             else:
-                # Add sentence to current chunk
                 current_chunk.append(sentence)
                 current_tokens += sentence_tokens
         
-        # ✅ Add remaining/final chunk
         if current_chunk:
             chunk_text = ' '.join(current_chunk)
             chunks.append(Chunk(
@@ -195,14 +193,17 @@ class IntelligentChunker:
                     'token_count': current_tokens,
                     'sentence_count': len(current_chunk),
                     'is_final': True
-                }
+                },
+                paper_name=paper_name,  # ✅ ADD THIS
+                section_id=section_id,  # ✅ ADD THIS
+                section_level=section_level  # ✅ ADD THIS
             ))
         
-        # Log statistics
         avg_tokens = sum(c.metadata['token_count'] for c in chunks) / len(chunks) if chunks else 0
         logger.info(
             f"Created {len(chunks)} chunks from '{section_name}' "
-            f"(avg {avg_tokens:.0f} tokens/chunk)"
+            f"(avg {avg_tokens:.0f} tokens/chunk) | "  # ✅ ADD THIS
+            f"paper: {paper_name} | section_id: {section_id}"  # ✅ ADD THIS
         )
         
         return chunks

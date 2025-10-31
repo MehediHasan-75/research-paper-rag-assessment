@@ -1,0 +1,3715 @@
+# src/services/rag_pipeline.py
+import ollama
+from typing import List, Dict, Optional
+import time
+from src.models.database import Paper
+
+
+class RAGPipeline:
+    def __init__(self, qdrant_service, embedding_service, db_session, 
+                 model: str = "deepseek-r1:8b"):
+        self.qdrant = qdrant_service
+        self.embedder = embedding_service
+        self.db = db_session
+        self.model = model
+    
+    def generate_answer(self, question: str, top_k: int = 5, 
+                       paper_ids: Optional[List[int]] = None) -> Dict:
+        """Main RAG pipeline with paper_name tracking"""
+        start_time = time.time()
+        
+        # 1. Encode query
+        query_vector = self.embedder.encode_single(question)
+        
+        # 2. Retrieve relevant chunks
+        search_results = self.qdrant.search(
+            query_vector=query_vector.tolist(),
+            top_k=top_k,
+            paper_ids=paper_ids
+        )
+        
+        if not search_results:
+            return {
+                'answer': "No relevant information found in the papers.",
+                'citations': [],
+                'sources_used': [],
+                'confidence': 0.0,
+                'response_time': time.time() - start_time
+            }
+        
+        # 3. Build context
+        context_parts = []
+        for i, result in enumerate(search_results, 1):
+            paper = self.db.query(Paper).filter(Paper.id == result['paper_id']).first()
+            # ✅ INCLUDE PAPER_NAME IN CONTEXT
+            context_parts.append(
+                f"[Source {i}] From '{paper.title}' (paper_name: {paper.paper_name}), {result['section']} (Page {result['page']}):\n"
+                f"{result['text']}\n"
+            )
+        
+        context = "\n".join(context_parts)
+        
+        # 4. Generate answer with LLM
+        prompt = f"""You are a research assistant helping analyze academic papers.
+
+
+Context from research papers:
+{context}
+
+
+Question: {question}
+
+
+Instructions:
+- Provide a clear, accurate answer based ONLY on the context provided
+- Cite specific sources using [Source N] notation
+- If the context doesn't fully answer the question, acknowledge what's missing
+- Be concise but comprehensive
+
+
+Answer:"""
+        
+        response = ollama.chat(
+            model=self.model,
+            messages=[{'role': 'user', 'content': prompt}]
+        )
+        
+        answer = response['message']['content']
+        
+        # 5. Build citations with paper_name
+        citations = []
+        for result in search_results:
+            paper = self.db.query(Paper).filter(Paper.id == result['paper_id']).first()
+            citations.append({
+                'paper_title': paper.title,
+                'paper_name': paper.paper_name,  # ✅ ADD THIS
+                'section': result['section'],
+                'page': result['page'],
+                'relevance_score': round(result['score'], 3)
+            })
+        
+        # 6. Calculate confidence (average of top 3 scores)
+        confidence = sum(r['score'] for r in search_results[:3]) / min(3, len(search_results))
+        
+        response_time = time.time() - start_time
+        
+        return {
+            'answer': answer,
+            'citations': citations,
+            'sources_used': list(set(c['paper_title'] for c in citations)),
+            'confidence': round(confidence, 2),
+            'response_time': round(response_time, 2)
+        }
+
+//routets.py
+# src/api/routes.py (CORRECTED SECTION WITH PAPER_NAME EXTRACTION)
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Query, Body
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+from typing import List, Optional
+import os
+import uuid
+import shutil
+import logging
+from datetime import datetime
+from pathlib import Path  # ✅ ADD THIS
+
+
+from src.models.database import Paper, Chunk, QueryHistory, Citation, QueryPaper, get_db
+from src.services.pdf_processor import pdf_processor
+from src.services.chunking_service import intelligent_chunker
+from src.services.embedding_service import embedding_service
+from src.services.qdrant_service import qdrant_service
+from src.services.cache_service import cache_service
+from src.services.rag_pipeline import RAGPipeline
+from src.config import settings
+
+
+logger = logging.getLogger(__name__)
+
+
+router = APIRouter(tags=["rag"])
+
+
+# Create uploads directory from settings
+os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
+
+
+
+# ========== HELPER FUNCTIONS ==========
+
+
+def get_rag_pipeline(db: Session) -> RAGPipeline:
+    """Factory function to instantiate RAGPipeline with dependencies"""
+    return RAGPipeline(
+        qdrant_service=qdrant_service,
+        embedding_service=embedding_service,
+        db_session=db,
+        model=getattr(settings, 'LLM_MODEL', 'deepseek-r1:8b')
+    )
+
+
+
+def _save_query_history(
+    db: Session,
+    query_text: str,
+    top_k: int,
+    response_time: float,
+    confidence: float,
+    answer: str = None,
+    paper_filter: Optional[List[int]] = None,
+    user_rating: Optional[int] = None
+) -> int:
+    """
+    Helper to save query to history for analytics
+    Matches QueryHistory model exactly
+    """
+    query_history = QueryHistory(
+        query_text=query_text,
+        answer=answer,
+        top_k=top_k,
+        response_time=response_time,
+        confidence=confidence,
+        paper_filter=paper_filter,  # ✅ CORRECT FIELD NAME
+        user_rating=user_rating
+    )
+    db.add(query_history)
+    db.commit()
+    db.refresh(query_history)
+    logger.info(f"✅ Query saved to history (ID={query_history.id})")
+    return query_history.id
+
+
+
+def _save_citations(
+    db: Session,
+    query_id: int,
+    rag_result: dict,
+    paper_title_to_id_map: dict,
+    paper_name_to_id_map: dict = None
+):
+    """Helper to save citations from RAG result to database"""
+    
+    # ✅ TRACK WHICH PAPERS WE'VE ALREADY CITED
+    cited_papers = set()
+    
+    for citation_data in rag_result.get('citations', []):
+        paper_title = citation_data.get('paper_title')
+        
+        paper_id = None
+        if paper_name_to_id_map and citation_data.get('paper_name'):
+            paper_id = paper_name_to_id_map.get(citation_data.get('paper_name'))
+        
+        if not paper_id:
+            paper_id = paper_title_to_id_map.get(paper_title)
+        
+        if not paper_id:
+            logger.warning(f"⚠️ Paper not found for citation: {paper_title}")
+            continue
+        
+        # ✅ SKIP IF WE ALREADY CITED THIS PAPER FOR THIS QUERY
+        if (query_id, paper_id) in cited_papers:
+            logger.info(f"⊘ Citation already exists for query {query_id}, paper {paper_id}")
+            continue
+        
+        try:
+            # ✅ Use get_or_create pattern to avoid duplicates
+            existing = db.query(Citation).filter(
+                Citation.query_id == query_id,
+                Citation.paper_id == paper_id
+            ).first()
+            
+            if existing:
+                # Update relevance score with highest value
+                existing.relevance_score = max(
+                    existing.relevance_score,
+                    citation_data.get('relevance_score', 0.0)
+                )
+                logger.info(f"⊘ Updated existing citation: query {query_id}, paper {paper_id}")
+            else:
+                # Create new citation
+                citation = Citation(
+                    query_id=query_id,
+                    paper_id=paper_id,
+                    chunk_id=None,
+                    relevance_score=citation_data.get('relevance_score', 0.0)
+                )
+                db.add(citation)
+                cited_papers.add((query_id, paper_id))
+        
+        except Exception as e:
+            logger.error(f"❌ Failed to save citation: {e}")
+    
+    db.commit()
+    logger.info(f"✅ Saved {len(cited_papers)} unique citations")
+
+
+
+# ========== DOCUMENT INGESTION SYSTEM ==========
+
+
+# src/api/routes.py - FIXED UPLOAD ENDPOINT
+
+@router.post("/papers/upload")
+async def upload(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
+    """Upload and process PDF with paper_name extraction from filename"""
+    
+    # Validate file
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files allowed")
+    
+    if file.size and file.size > settings.MAX_UPLOAD_SIZE * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large (max 50MB)")
+    
+    logger.info(f"📄 Uploading: {file.filename}")
+    
+    # ✅ EXTRACT PAPER_NAME FROM FILENAME (without extension)
+    paper_name = Path(file.filename).stem
+    logger.info(f"📝 Paper name extracted: {paper_name}")
+    
+    # ✅ CHECK FOR DUPLICATES BY BOTH paper_name AND filename
+    existing_by_name = db.query(Paper).filter(Paper.paper_name == paper_name).first()
+    existing_by_filename = db.query(Paper).filter(Paper.filename == file.filename).first()
+    
+    if existing_by_name or existing_by_filename:
+        existing = existing_by_name or existing_by_filename
+        logger.warning(f"⚠️ Paper already exists: {paper_name} (ID={existing.id})")
+        return {
+            "paper_id": existing.id,
+            "paper_name": existing.paper_name,
+            "title": existing.title,
+            "status": "already_exists",
+            "message": "This paper was already uploaded",
+            "uploaded": existing.upload_date.isoformat()
+        }
+    
+    file_path = os.path.join(settings.UPLOAD_DIR, str(uuid.uuid4()) + ".pdf")
+
+    try:
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+        logger.error(f"❌ File save failed: {e}")
+        raise HTTPException(status_code=500, detail=f"File save failed: {str(e)}")
+    
+    # Process PDF
+    try:
+        processed_doc = pdf_processor.process_document(file_path)
+        if not processed_doc:
+            os.remove(file_path)
+            logger.error("PDF processing returned None")
+            raise HTTPException(status_code=500, detail="PDF processing failed")
+    except Exception as e:
+        os.remove(file_path)
+        logger.error(f"❌ PDF processing failed: {e}")
+        raise HTTPException(status_code=500, detail=f"PDF processing failed: {str(e)}")
+    
+    try:
+        # ✅ SAVE PAPER WITH PAPER_NAME AND ALL METADATA
+ # ...
+        paper = Paper(
+            paper_name=paper_name,
+            title=processed_doc.title or "Unknown",
+            authors=processed_doc.authors or [],
+            year=processed_doc.year,
+            filename=file.filename,
+            file_path=file_path,
+            total_pages=processed_doc.total_pages or 0,
+            abstract=processed_doc.abstract or "",
+            sections=[
+                {
+                    "name": section.name,
+                    "page_start": section.page_start,
+                    "page_end": section.page_end,
+                    "section_id": getattr(section, "section_id", None),
+                    "level": getattr(section, "level", 0),
+                }
+                for section in processed_doc.sections
+            ] if processed_doc.sections else [],
+            quality_score=processed_doc.quality_metrics.get('overall_quality', 0),
+            keywords=processed_doc.keywords or [],
+            format_type=processed_doc.format_type or "standard",
+            processed=False
+        )
+
+        db.add(paper)
+        db.commit()
+        db.refresh(paper)
+        logger.info(f"✅ Paper saved: ID={paper.id}, paper_name={paper_name}, quality={paper.quality_score:.2f}")
+    except Exception as e:
+        db.rollback()
+        os.remove(file_path)
+        logger.error(f"❌ Failed to save paper: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save paper: {str(e)}")
+    
+    # Step 1: Create chunks with BATCH COMMITS
+    chunk_count = 0
+    try:
+        for section in processed_doc.sections:
+            chunks = intelligent_chunker.chunk_section(
+                section_text=section.text,
+                section_name=section.name,
+                page_start=section.page_start,
+                page_end=section.page_end,
+                paper_name=paper_name,  # ✅ ADD THIS
+                section_id=section.section_id,  # ✅ ADD THIS
+                section_level=section.level  # ✅ ADD THIS
+            )
+            
+            for chunk in chunks:
+                db_chunk = Chunk(
+                    paper_id=paper.id,
+                    chunk_index=chunk.chunk_index,
+                    text=chunk.text,
+                    section=chunk.section,
+                    page_number=chunk.page_number,
+                    section_id=chunk.section_id,  # ✅ ADD THIS
+                    section_level=chunk.section_level  # ✅ ADD THIS
+                )
+                db.add(db_chunk)
+                chunk_count += 1
+                
+                # BATCH COMMIT: Every 10 chunks
+                if chunk_count % 10 == 0:
+                    db.commit()
+                    logger.info(f"✅ Committed {chunk_count} chunks...")
+        
+        db.commit()
+        logger.info(f"✅ All {chunk_count} chunks committed")
+    except Exception as e:
+        db.rollback()
+        logger.error(f"❌ Chunk creation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Chunk creation failed: {str(e)}")
+    
+    # Step 2: Get chunk IDs from database
+    try:
+        db_chunks = db.query(Chunk).filter(Chunk.paper_id == paper.id).all()
+        logger.info(f"✅ Retrieved {len(db_chunks)} chunks from database")
+        
+        if not db_chunks:
+            logger.warning(f"⚠️ No chunks retrieved for paper {paper_name}")
+        
+        chunk_dicts = [
+            {
+                'id': c.id,
+                'text': c.text,
+                'section': c.section,
+                'page_number': c.page_number,
+                'paper_name': paper_name,  # ✅ ADD THIS
+                'section_id': c.section_id,  # ✅ ADD THIS
+                'section_level': c.section_level  # ✅ ADD THIS
+            }
+            for c in db_chunks
+        ]
+    except Exception as e:
+        logger.error(f"❌ Failed to retrieve chunks: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve chunks: {str(e)}")
+    
+    # Step 3: Generate embeddings
+    try:
+        embedding_texts = [c['text'] for c in chunk_dicts]
+        embeddings = embedding_service.encode_batch(embedding_texts)
+        logger.info(f"✅ Generated {len(embeddings)} embeddings")
+    except Exception as e:
+        logger.error(f"❌ Embedding failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Embedding generation failed: {str(e)}")
+    
+    # Step 4: Store in Qdrant
+    try:
+        vector_ids = qdrant_service.upsert_chunks(chunk_dicts, embeddings, paper.id)
+        logger.info(f"✅ Stored {len(vector_ids)} vectors in Qdrant")
+    except Exception as e:
+        logger.error(f"❌ Qdrant storage failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Vector storage failed: {str(e)}")
+    
+    # Step 5: Update vector IDs
+    try:
+        for db_chunk, vector_id in zip(db_chunks, vector_ids):
+            db_chunk.vector_id = vector_id
+            db_chunk.embedding_generated = True
+        
+        db.commit()
+        logger.info(f"✅ Updated {len(db_chunks)} vector IDs")
+    except Exception as e:
+        db.rollback()
+        logger.error(f"❌ Failed to update vector IDs: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update vector IDs: {str(e)}")
+    
+    # Step 6: Mark as processed
+    try:
+        paper.processed = True
+        paper.chunk_count = len(db_chunks)
+        db.commit()
+        logger.info(f"✅ Paper marked as processed")
+    except Exception as e:
+        db.rollback()
+        logger.error(f"❌ Failed to mark paper as processed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to mark paper as processed: {str(e)}")
+    
+    logger.info(f"✅ Upload complete: {len(db_chunks)} chunks, quality={paper.quality_score:.2f}")
+    
+    return {
+        "paper_id": paper.id,
+        "paper_name": paper_name,  # ✅ ADD THIS
+        "title": paper.title,
+        "authors": paper.authors,
+        "year": paper.year,
+        "keywords": paper.keywords,  # ✅ ADD THIS
+        "quality_score": paper.quality_score,  # ✅ ADD THIS
+        "format_type": paper.format_type,  # ✅ ADD THIS
+        "sections_extracted": len(processed_doc.sections),
+        "chunks_created": len(db_chunks),
+        "pages": paper.total_pages,
+        "upload_status": "success",
+        "message": f"Successfully uploaded and processed {paper_name}"
+    }
+
+
+
+# ========== RAG QUERY SYSTEM ==========
+
+
+@router.post("/query")
+async def rag_query(
+    question: str = Query(..., min_length=3, max_length=500, description="User question"),
+    top_k: int = Query(5, ge=1, le=20, description="Number of chunks to retrieve"),
+    paper_ids: Optional[List[int]] = Query(None, description="Optional: filter by paper IDs"),
+    use_cache: bool = Query(True, description="Enable response caching"),
+    db: Session = Depends(get_db)
+):
+    """🚀 Full RAG-Powered Query Endpoint with paper_name in sources"""
+    logger.info(f"🔍 RAG Query: {question[:50]}...")
+    
+    if use_cache:
+        cached = cache_service.get_query_cache(question, paper_ids)
+        if cached:
+            logger.info("✅ Cache hit")
+            cached['cached'] = True
+            return cached
+    
+    try:
+        rag_pipeline = get_rag_pipeline(db)
+        rag_result = rag_pipeline.generate_answer(question=question, top_k=top_k, paper_ids=paper_ids)
+        
+        # ✅ CREATE PAPER_NAME MAPPING
+        paper_title_to_id_map = {}
+        paper_title_to_name_map = {}
+        
+        for citation_data in rag_result.get('citations', []):
+            paper_title = citation_data.get('paper_title')
+            paper = db.query(Paper).filter(Paper.title == paper_title).first()
+            if paper:
+                paper_title_to_id_map[paper_title] = paper.id
+                paper_title_to_name_map[paper_title] = paper.paper_name
+        
+        query_id = _save_query_history(
+            db=db, query_text=question, top_k=top_k,
+            response_time=rag_result['response_time'],
+            confidence=rag_result['confidence'],
+            answer=rag_result['answer'],
+            paper_filter=paper_ids
+        )
+        
+        _save_citations(db, query_id, rag_result, paper_title_to_id_map)
+        
+        # ✅ UPDATE sources_used to use paper_name
+        rag_result['sources_used'] = list(set(
+            paper_title_to_name_map.get(c.get('paper_title'), c.get('paper_title'))
+            for c in rag_result.get('citations', [])
+        ))
+        
+        # ✅ UPDATE citations to use paper_name
+        for citation in rag_result.get('citations', []):
+            paper_title = citation.get('paper_title')
+            paper_name = paper_title_to_name_map.get(paper_title, paper_title)
+            citation['paper_name'] = paper_name
+        
+        if use_cache:
+            cache_service.set_query_cache(question, rag_result, paper_ids)
+        
+        rag_result['cached'] = False
+        logger.info(f"✅ Query answered in {rag_result['response_time']}s. Sources: {rag_result['sources_used']}")
+        return rag_result
+        
+    except Exception as e:
+        logger.error(f"❌ RAG query failed: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
+
+
+ 
+
+
+@router.post("/query/batch")
+async def rag_query_batch(
+    questions: List[str] = Body(..., min_items=1, max_items=10),
+    top_k: int = Body(5, ge=1, le=20),
+    paper_ids: Optional[List[int]] = Body(None),
+    db: Session = Depends(get_db)
+):
+    """⚡ Batch RAG Query Processing with paper_name in sources"""
+    logger.info(f"⚡ Processing batch of {len(questions)} queries")
+    
+    results = []
+    rag_pipeline = get_rag_pipeline(db)
+    
+    # ✅ CREATE PAPER_NAME MAPPING ONCE
+    paper_title_to_id_map = {}
+    paper_title_to_name_map = {}
+    all_papers = db.query(Paper).all()
+    for paper in all_papers:
+        paper_title_to_id_map[paper.title] = paper.id
+        paper_title_to_name_map[paper.title] = paper.paper_name
+    
+    for idx, question in enumerate(questions, 1):
+        try:
+            logger.info(f"Processing query {idx}/{len(questions)}")
+            result = rag_pipeline.generate_answer(question=question, top_k=top_k, paper_ids=paper_ids)
+            
+            query_id = _save_query_history(
+                db=db, query_text=question, top_k=top_k,
+                response_time=result['response_time'],
+                confidence=result['confidence'],
+                answer=result['answer'],
+                paper_filter=paper_ids
+            )
+            
+            _save_citations(db, query_id, result, paper_title_to_id_map)
+            
+            # ✅ UPDATE sources_used
+            result['sources_used'] = list(set(
+                paper_title_to_name_map.get(c.get('paper_title'), c.get('paper_title'))
+                for c in result.get('citations', [])
+            ))
+            
+            # ✅ UPDATE citations
+            for citation in result.get('citations', []):
+                paper_title = citation.get('paper_title')
+                paper_name = paper_title_to_name_map.get(paper_title, paper_title)
+                citation['paper_name'] = paper_name
+            
+            result['question'] = question
+            result['batch_index'] = idx
+            result['success'] = True
+            results.append(result)
+            
+        except Exception as e:
+            logger.error(f"Failed to process query {idx}: {str(e)}")
+            results.append({
+                "question": question,
+                "batch_index": idx,
+                "error": str(e),
+                "success": False
+            })
+    
+    logger.info(f"✅ Batch processing complete: {len(results)} results")
+    return {
+        "total_queries": len(questions),
+        "successful": sum(1 for r in results if r.get('success', True)),
+        "results": results
+    }
+
+
+
+
+@router.get("/papers")
+async def list_papers(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=100),
+    min_quality: Optional[float] = Query(None, ge=0, le=1, description="Filter by minimum quality"),  # ✅ ADD
+    db: Session = Depends(get_db)
+):
+    """List all uploaded papers with pagination and quality filtering"""
+    query = db.query(Paper)
+    
+    # ✅ ADD QUALITY FILTERING
+    if min_quality is not None:
+        query = query.filter(Paper.quality_score >= min_quality)
+    
+    papers = query.offset(skip).limit(limit).all()
+    total = query.count()
+    
+    return {
+        "papers": [
+            {
+                "id": p.id,
+                "paper_name": p.paper_name,  # ✅ ADD THIS
+                "title": p.title,
+                "authors": p.authors,
+                "year": p.year,
+                "pages": p.total_pages,
+                "chunks": p.chunk_count,
+                "quality_score": p.quality_score,  # ✅ ADD THIS
+                "keywords": p.keywords,  # ✅ ADD THIS
+                "processed": p.processed,
+                "uploaded": p.upload_date.isoformat()
+            }
+            for p in papers
+        ],
+        "total": total,
+        "skip": skip,
+        "limit": limit
+    }
+
+
+
+@router.get("/papers/{paper_id}")
+async def get_paper(paper_id: int, db: Session = Depends(get_db)):
+    """Get detailed paper information"""
+    paper = db.query(Paper).filter(Paper.id == paper_id).first()
+    
+    if not paper:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    
+    return {
+        "id": paper.id,
+        "paper_name": paper.paper_name,  # ✅ ADD THIS
+        "title": paper.title,
+        "authors": paper.authors,
+        "year": paper.year,
+        "keywords": paper.keywords,  # ✅ ADD THIS
+        "quality_score": paper.quality_score,  # ✅ ADD THIS
+        "abstract": paper.abstract,
+        "sections": paper.sections,
+        "pages": paper.total_pages,
+        "chunks": paper.chunk_count,
+        "processed": paper.processed,
+        "uploaded": paper.upload_date.isoformat()
+    }
+
+
+
+@router.delete("/papers/{paper_id}")
+async def delete_paper(paper_id: int, db: Session = Depends(get_db)):
+    """Remove paper + vectors from Qdrant + chunks from database"""
+    paper = db.query(Paper).filter(Paper.id == paper_id).first()
+    
+    if not paper:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    
+    try:
+        qdrant_service.delete_by_paper(paper_id)
+    except Exception as e:
+        logger.warning(f"Qdrant deletion failed: {e}")
+    
+    db.delete(paper)
+    db.commit()
+    
+    logger.info(f"✅ Paper deleted: {paper.title}")
+    
+    return {
+        "id": paper_id,
+        "paper_name": paper.paper_name,  # ✅ ADD THIS
+        "status": "deleted",
+        "title": paper.title
+    }
+
+
+
+@router.get("/papers/{paper_id}/stats")
+async def paper_stats(paper_id: int, db: Session = Depends(get_db)):
+    """View paper statistics"""
+    paper = db.query(Paper).filter(Paper.id == paper_id).first()
+    
+    if not paper:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    
+    citations_count = db.query(Citation).filter(Citation.paper_id == paper_id).count()
+    
+    from sqlalchemy import func
+    query_count = db.query(func.count(QueryHistory.id)).filter(
+        text(f"paper_filter::text LIKE '%{paper_id}%'")
+    ).scalar() or 0
+    
+    return {
+        "paper_id": paper_id,
+        "paper_name": paper.paper_name,  # ✅ ADD THIS
+        "title": paper.title,
+        "quality_score": paper.quality_score,  # ✅ ADD THIS
+        "keywords": paper.keywords,  # ✅ ADD THIS
+        "chunks_created": paper.chunk_count,
+        "times_cited": citations_count,
+        "times_queried": query_count,
+        "pages": paper.total_pages,
+        "uploaded": paper.upload_date.isoformat()
+    }
+
+
+
+@router.get("/queries/history")
+async def queries_history(
+    limit: int = Query(10, ge=1, le=100),
+    db: Session = Depends(get_db)
+):
+    """Recent queries with response times"""
+    queries = db.query(QueryHistory).order_by(
+        QueryHistory.timestamp.desc()
+    ).limit(limit).all()
+    
+    return {
+        "queries": [
+            {
+                "id": q.id,
+                "query": q.query_text,
+                "answer_preview": q.answer[:200] if q.answer else None,
+                "response_time_ms": round(q.response_time * 1000, 2) if q.response_time else None,
+                "confidence": q.confidence,
+                "user_rating": q.user_rating,
+                "paper_filter": q.paper_filter,
+                "timestamp": q.timestamp.isoformat()
+            }
+            for q in queries
+        ],
+        "total": len(queries)
+    }
+
+
+
+@router.get("/analytics/popular")
+async def analytics_popular(
+    limit: int = Query(10, ge=1, le=100),
+    db: Session = Depends(get_db)
+):
+    """Most frequently asked questions"""
+    from sqlalchemy import func
+    
+    popular = db.query(
+        QueryHistory.query_text,
+        func.count(QueryHistory.id).label('count'),
+        func.avg(QueryHistory.confidence).label('avg_confidence')
+    ).group_by(QueryHistory.query_text).order_by(
+        func.count(QueryHistory.id).desc()
+    ).limit(limit).all()
+    
+    return {
+        "popular_queries": [
+            {
+                "query": q[0],
+                "count": q[1],
+                "avg_confidence": round(q[2], 3) if q[2] else 0
+            }
+            for q in popular
+        ],
+        "total_queries": db.query(QueryHistory).count()
+    }
+
+
+
+@router.get("/analytics/papers")
+async def analytics_papers(db: Session = Depends(get_db)):
+    """Paper usage statistics with paper_name"""
+    from sqlalchemy import func
+    
+    stats = db.query(
+        Paper.id,
+        Paper.paper_name,  # ✅ ADD THIS
+        Paper.title,
+        Paper.quality_score,  # ✅ ADD THIS
+        func.count(Citation.id).label('citations')
+    ).outerjoin(Citation, Paper.id == Citation.paper_id).group_by(
+        Paper.id
+    ).all()
+    
+    return {
+        "paper_stats": [
+            {
+                "id": s[0],
+                "paper_name": s[1],  # ✅ ADD THIS
+                "title": s[2],
+                "quality_score": s[3],  # ✅ ADD THIS
+                "times_cited": s[4] or 0
+            }
+            for s in stats
+        ]
+    }
+
+
+
+@router.get("/analytics/performance")
+async def analytics_performance(db: Session = Depends(get_db)):
+    """System performance metrics"""
+    from sqlalchemy import func
+    
+    queries = db.query(QueryHistory).all()
+    
+    if not queries:
+        return {
+            "total_queries": 0,
+            "avg_response_time_ms": 0,
+            "avg_confidence": 0,
+            "avg_user_rating": None,
+            "avg_extraction_quality": None  # ✅ ADD THIS
+        }
+    
+    avg_time = sum(q.response_time or 0 for q in queries) / len(queries)
+    avg_conf = sum(q.confidence or 0 for q in queries) / len(queries)
+    
+    rated_queries = [q for q in queries if q.user_rating is not None]
+    avg_rating = sum(q.user_rating for q in rated_queries) / len(rated_queries) if rated_queries else None
+    
+    # ✅ ADD EXTRACTION QUALITY
+    papers = db.query(Paper).all()
+    avg_extraction_quality = (
+        sum(p.quality_score for p in papers) / len(papers)
+        if papers else None
+    )
+    
+    return {
+        "total_queries": len(queries),
+        "total_papers": db.query(Paper).count(),
+        "total_chunks": db.query(Chunk).count(),
+        "avg_response_time_ms": round(avg_time * 1000, 2),
+        "avg_confidence": round(avg_conf, 3),
+        "avg_user_rating": round(avg_rating, 2) if avg_rating else None,
+        "rated_responses_count": len(rated_queries),
+        "avg_extraction_quality": round(avg_extraction_quality, 3) if avg_extraction_quality else None  # ✅ ADD THIS
+    }
+
+
+
+@router.get("/health")
+async def health():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "services": {
+            "api": "running",
+            "pdf_processor": "enhanced",  # ✅ UPDATED
+            "chunking": "enhanced",  # ✅ UPDATED
+            "embedding": "ready",
+            "qdrant": "ready",
+            "cache": "ready",
+            "rag_pipeline": "ready"
+        }
+    }
+
+
+
+@router.get("/")
+async def root():
+    """Welcome message with API documentation"""
+    return {
+        "message": "🚀 Research Paper RAG System",
+        "version": "2.1",  # ✅ UPDATED
+        "features_enhanced": [  # ✅ ADD THIS
+            "Paper name extraction from PDF filenames",
+            "Quality score tracking for extraction accuracy",
+            "Automatic keywords and citation extraction",
+            "Section hierarchy detection (2.1, 3.2.1, etc.)",
+            "Format type classification (standard/report/commentary)"
+        ],
+        "endpoints": {
+            "document_ingestion": {
+                "upload_paper": "POST /api/papers/upload"
+            },
+            "rag_queries": {
+                "basic_rag_query": "POST /api/query (with query params)",
+                
+                "batch_rag_query": "POST /api/query/batch"
+            },
+            "paper_management": {
+                "list_papers": "GET /api/papers (with quality filter)",  # ✅ UPDATED
+                "get_paper_details": "GET /api/papers/{paper_id}",
+                "delete_paper": "DELETE /api/papers/{paper_id}",
+                "paper_statistics": "GET /api/papers/{paper_id}/stats"
+            },
+            "analytics": {
+                "query_history": "GET /api/queries/history",
+                "popular_queries": "GET /api/analytics/popular",
+                "paper_usage": "GET /api/analytics/papers",
+                "performance_metrics": "GET /api/analytics/performance"
+            },
+            "system": {
+                "health_check": "GET /api/health",
+                "documentation": "GET /docs",
+                "openapi_schema": "GET /openapi.json"
+            }
+        },
+        "features": [
+            "Semantic search with vector embeddings",
+            "LLM-powered answer generation",
+            "Automatic citation extraction and storage",
+            "Query result caching",
+            "Batch query processing",
+            "User rating system",
+            "Comprehensive analytics and performance tracking",
+            "✅ Paper name based source tracking",
+            "✅ Extraction quality metrics",
+            "✅ Section hierarchy support"
+        ]
+    }
+
+//chunking service.py
+from typing import List, Dict, Optional
+from dataclasses import dataclass, field
+from transformers import AutoTokenizer
+import re
+import logging
+import os
+from src.config import settings
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Chunk:
+    """Represents a text chunk with enhanced metadata"""
+    text: str
+    section: str
+    page_number: int
+    chunk_index: int
+    metadata: Dict = field(default_factory=dict)
+    
+    paper_name: Optional[str] = None  # From PDF filename
+    section_id: Optional[str] = None  # e.g., "2.1"
+    section_level: int = 0  # 0=main, 1=sub, 2=subsub
+
+
+class IntelligentChunker:
+    """
+    Production-grade intelligent chunking for research papers with paper_name tracking
+    """
+    
+    def __init__(self, 
+                 model_name: str = settings.EMBEDDING_MODEL,
+                 chunk_size: int = settings.CHUNK_SIZE,
+                 overlap: int = settings.CHUNK_OVERLAP):
+        self.chunk_size = chunk_size
+        self.overlap = overlap
+        
+        if os.getenv('HF_HUB_OFFLINE') == '1' or os.getenv('TRANSFORMERS_OFFLINE') == '1':
+            self.tokenizer = None
+            logger.info("Offline mode enabled; using word-based token estimation.")
+        else:
+            try:
+                hf_token = os.getenv('HUGGING_FACE_HUB_TOKEN') or os.getenv('HUGGINGFACE_HUB_TOKEN')
+                try:
+                    # Prefer full repo id first
+                    self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
+                except TypeError:
+                    # Older transformers versions use use_auth_token
+                    self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_auth_token=hf_token)
+                logger.info(f"✅ Loaded tokenizer: {model_name}")
+            except Exception as e:
+                # Fallback to normalized name if the full repo id isn't a tokenizer repo
+                try:
+                    normalized_name = model_name.replace('sentence-transformers/', '')
+                    try:
+                        self.tokenizer = AutoTokenizer.from_pretrained(normalized_name, token=hf_token)
+                    except TypeError:
+                        self.tokenizer = AutoTokenizer.from_pretrained(normalized_name, use_auth_token=hf_token)
+                    logger.info(f"✅ Loaded tokenizer (fallback): {normalized_name}")
+                except Exception:
+                    logger.warning(f"Failed to load tokenizer: {e}. Falling back to word estimation.")
+                    self.tokenizer = None
+    
+    def estimate_tokens(self, text: str) -> int:
+        """Accurate token estimation"""
+        if self.tokenizer:
+            return len(self.tokenizer.encode(text, add_special_tokens=False))
+        else:
+            return int(len(text.split()) * 1.3)
+    
+    def split_into_sentences(self, text: str) -> List[str]:
+        """Split text into sentences, preserving academic formatting"""
+        sentences = re.split(
+            r'(?<!\d)\.(?!\d)(?!\s*al\.)(?!\s*Fig\.)(?!\s*Tab\.)(?!\s*Eq\.)'
+            r'(?!\s*Dr\.)(?!\s*Prof\.)(?!\s*Inc\.)(?!\s*Ltd\.)(?!\s*etc\.)\s+',
+            text
+        )
+        return [s.strip() for s in sentences if s.strip()]
+    
+    def chunk_section(self, 
+                     section_text: str, 
+                     section_name: str, 
+                     page_start: int, 
+                     page_end: int,
+                     paper_name: Optional[str] = None,  # ✅ ADD THIS
+                     section_id: Optional[str] = None,  # ✅ ADD THIS
+                     section_level: int = 0  # ✅ ADD THIS
+                     ) -> List[Chunk]:
+        """
+        Create optimally-sized chunks from a section with paper_name tracking
+        
+        Args:
+            section_text: Text to chunk
+            section_name: Section name
+            page_start: Starting page
+            page_end: Ending page
+            paper_name: ✅ NEW: PDF filename (e.g., "lwe_optimization_2024")
+            section_id: ✅ NEW: Section numbering (e.g., "2.1")
+            section_level: ✅ NEW: Hierarchy level (0=main, 1=sub)
+        """
+        sentences = self.split_into_sentences(section_text)
+        chunks = []
+        current_chunk = []
+        current_tokens = 0
+        chunk_index = 0
+        
+        for sentence in sentences:
+            sentence_tokens = self.estimate_tokens(sentence)
+            
+            if sentence_tokens > self.chunk_size:
+                logger.warning(f"Long sentence ({sentence_tokens} tokens) in {section_name}")
+                if self.tokenizer:
+                    tokens = self.tokenizer.encode(sentence, add_special_tokens=False)
+                    for i in range(0, len(tokens), self.chunk_size - self.overlap):
+                        chunk_tokens = tokens[i:i + self.chunk_size]
+                        chunk_text = self.tokenizer.decode(chunk_tokens)
+                        chunks.append(Chunk(
+                            text=chunk_text,
+                            section=section_name,
+                            page_number=page_start,
+                            chunk_index=chunk_index,
+                            metadata={
+                                'token_count': len(chunk_tokens),
+                                'is_partial_sentence': True,
+                                'warning': 'sentence_too_long'
+                            },
+                            paper_name=paper_name,  # ✅ ADD THIS
+                            section_id=section_id,  # ✅ ADD THIS
+                            section_level=section_level  # ✅ ADD THIS
+                        ))
+                        chunk_index += 1
+                else:
+                    chunks.append(Chunk(
+                        text=sentence,
+                        section=section_name,
+                        page_number=page_start,
+                        chunk_index=chunk_index,
+                        metadata={
+                            'token_count': sentence_tokens,
+                            'is_partial_sentence': True,
+                            'warning': 'long_sentence_no_tokenizer'
+                        },
+                        paper_name=paper_name,  # ✅ ADD THIS
+                        section_id=section_id,  # ✅ ADD THIS
+                        section_level=section_level  # ✅ ADD THIS
+                    ))
+                    chunk_index += 1
+                continue
+            
+            if current_tokens + sentence_tokens > self.chunk_size and current_chunk:
+                chunk_text = ' '.join(current_chunk)
+                chunks.append(Chunk(
+                    text=chunk_text,
+                    section=section_name,
+                    page_number=page_start,
+                    chunk_index=chunk_index,
+                    metadata={
+                        'token_count': current_tokens,
+                        'sentence_count': len(current_chunk),
+                        'is_complete': True
+                    },
+                    paper_name=paper_name,  # ✅ ADD THIS
+                    section_id=section_id,  # ✅ ADD THIS
+                    section_level=section_level  # ✅ ADD THIS
+                ))
+                
+                overlap_sentences = []
+                overlap_tokens = 0
+                for s in reversed(current_chunk):
+                    s_tokens = self.estimate_tokens(s)
+                    if overlap_tokens + s_tokens <= self.overlap:
+                        overlap_sentences.insert(0, s)
+                        overlap_tokens += s_tokens
+                    else:
+                        break
+                
+                current_chunk = overlap_sentences + [sentence]
+                current_tokens = sum(self.estimate_tokens(s) for s in current_chunk)
+                chunk_index += 1
+            else:
+                current_chunk.append(sentence)
+                current_tokens += sentence_tokens
+        
+        if current_chunk:
+            chunk_text = ' '.join(current_chunk)
+            chunks.append(Chunk(
+                text=chunk_text,
+                section=section_name,
+                page_number=page_start,
+                chunk_index=chunk_index,
+                metadata={
+                    'token_count': current_tokens,
+                    'sentence_count': len(current_chunk),
+                    'is_final': True
+                },
+                paper_name=paper_name,  # ✅ ADD THIS
+                section_id=section_id,  # ✅ ADD THIS
+                section_level=section_level  # ✅ ADD THIS
+            ))
+        
+        avg_tokens = sum(c.metadata['token_count'] for c in chunks) / len(chunks) if chunks else 0
+        logger.info(
+            f"Created {len(chunks)} chunks from '{section_name}' "
+            f"(avg {avg_tokens:.0f} tokens/chunk) | "  # ✅ ADD THIS
+            f"paper: {paper_name} | section_id: {section_id}"  # ✅ ADD THIS
+        )
+        
+        return chunks
+
+
+# ✅ Global instance for easy import
+intelligent_chunker = IntelligentChunker()
+
+
+//database model.py
+from sqlalchemy import Column, Integer, String, Text, DateTime, Float, JSON, ForeignKey, Index, Boolean, create_engine, UniqueConstraint, CheckConstraint
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import relationship, sessionmaker, validates
+from datetime import datetime
+import os
+from src.config import settings
+
+
+Base = declarative_base()
+
+
+class Paper(Base):
+    __tablename__ = "papers"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    
+    # ✅ Paper name from PDF filename (stable identifier)
+    paper_name = Column(
+        String(255), 
+        unique=True, 
+        nullable=False, 
+        index=True
+    )
+    
+    title = Column(String(500), nullable=False, index=True)
+    authors = Column(JSON, default=[])  # List of author names
+    year = Column(Integer, index=True, nullable=True)  # ✅ NULLABLE - handle invalid years
+    filename = Column(String(255), unique=True, nullable=False)
+    file_path = Column(String(500))
+    total_pages = Column(Integer)
+    abstract = Column(Text)
+    sections = Column(JSON, default={})  # {section_name: page_range}
+    
+    # ✅ Quality metrics
+    quality_score = Column(
+        Float, 
+        default=0.0,
+        index=True
+    )
+    keywords = Column(JSON, default=[])  # Extracted keywords
+    format_type = Column(String(50), default="standard")  # standard/report/commentary
+    
+    # Timestamps
+    upload_date = Column(DateTime, default=datetime.utcnow, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Processing status
+    processed = Column(Boolean, default=False, index=True)
+    chunk_count = Column(Integer, default=0)
+    
+    # Relationships
+    chunks = relationship("Chunk", back_populates="paper", cascade="all, delete-orphan")
+    citations = relationship("Citation", back_populates="paper", cascade="all, delete-orphan")
+    
+    # ✅ FIXED: Better validation for quality_score
+    @validates('quality_score')
+    def validate_quality_score(self, key, value):
+        if value is None:
+            return 0.0
+        if not 0 <= value <= 1:
+            raise ValueError("quality_score must be between 0 and 1")
+        return value
+    
+    # ✅ FIXED: Better validation for year (more lenient)
+    @validates('year')
+    def validate_year(self, key, value):
+        if value is None:
+            return None  # Allow NULL years
+        
+        # Convert to int if it's a string
+        if isinstance(value, str):
+            try:
+                value = int(value)
+            except (ValueError, TypeError):
+                return None  # Return None if can't convert
+        
+        # Check if year is reasonable
+        current_year = datetime.now().year
+        
+        # Valid range: 1000 to 2100 (more lenient)
+        if isinstance(value, int):
+            if value <= 0 or value > 2150:  # ✅ Allow up to 2150
+                # Log warning but don't fail
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"⚠️  Invalid year detected: {value}. Setting to None.")
+                return None  # Return None instead of raising error
+        
+        return value
+    
+    def __repr__(self):
+        return f"<Paper(id={self.id}, paper_name={self.paper_name}, quality={self.quality_score:.2f})>"
+
+
+class Chunk(Base):
+    __tablename__ = "chunks"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    paper_id = Column(Integer, ForeignKey("papers.id", ondelete="CASCADE"), index=True)
+    chunk_index = Column(Integer)
+    text = Column(Text, nullable=False)
+    section = Column(String(500), index=True)  # Abstract, Introduction, etc.
+    page_number = Column(Integer, index=True)
+    
+    # ✅ Section hierarchy fields
+    section_id = Column(
+        String(50), 
+        nullable=True,
+        index=True  # Fast section-based search
+    )
+    section_level = Column(Integer, default=0)  # 0=main, 1=sub, 2=subsub
+    
+    # Vector storage
+    vector_id = Column(String(255), unique=True, index=True)  # UUID for Qdrant
+    embedding_generated = Column(Boolean, default=False)
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    paper = relationship("Paper", back_populates="chunks")
+    
+    __table_args__ = (
+        Index('idx_paper_chunk', 'paper_id', 'chunk_index'),  # Composite for efficient lookup
+        Index('idx_paper_section', 'paper_id', 'section_id'),  # Composite for section search
+        Index('idx_paper_page', 'paper_id', 'page_number'),  # Composite for page queries
+        CheckConstraint(
+            "(embedding_generated = FALSE) OR (vector_id IS NOT NULL)",
+            name='ck_vector_id_when_generated'  # Prevent orphaned embeddings
+        ),
+    )
+    
+    def __repr__(self):
+        return f"<Chunk(id={self.id}, paper_id={self.paper_id}, section={self.section_id})>"
+
+
+class QueryHistory(Base):
+    __tablename__ = "query_history"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    query_text = Column(Text, nullable=False, index=True)
+    answer = Column(Text)
+    top_k = Column(Integer, default=5)
+    response_time = Column(Float)  # in seconds
+    confidence = Column(Float)  # 0-1 confidence score
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    paper_filter = Column(JSON)  # Optional paper_ids used
+    user_rating = Column(Integer)  # 1-5 optional rating
+    
+    # ✅ Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    citations = relationship("Citation", back_populates="query", cascade="all, delete-orphan")
+    
+    # ✅ Composite indexes for analytics
+    __table_args__ = (
+        Index('idx_confidence', 'confidence'),  # Filter by confidence
+        Index('idx_user_rating', 'user_rating'),  # Filter by rating
+        Index('idx_created_at_query', 'created_at'),  # Time-range queries
+    )
+    
+    def __repr__(self):
+        return f"<QueryHistory(id={self.id}, query={self.query_text[:40]}..., confidence={self.confidence:.2f})>"
+
+
+class Citation(Base):
+    __tablename__ = "citations"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    query_id = Column(Integer, ForeignKey("query_history.id", ondelete="CASCADE"), index=True)
+    paper_id = Column(Integer, ForeignKey("papers.id", ondelete="CASCADE"), index=True)
+    chunk_id = Column(Integer, ForeignKey("chunks.id", ondelete="CASCADE"), nullable=True, index=True)
+    relevance_score = Column(Float, default=0.0)
+    
+    # ✅ Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    query = relationship("QueryHistory", back_populates="citations")
+    paper = relationship("Paper", back_populates="citations")
+    
+    # ✅ Unique constraint to prevent duplicate citations
+    __table_args__ = (
+        UniqueConstraint('query_id', 'paper_id', name='uq_query_paper'),
+    )
+    
+    def __repr__(self):
+        return f"<Citation(query_id={self.query_id}, paper_id={self.paper_id}, score={self.relevance_score:.2f})>"
+
+
+# ✅ OPTIONAL: Association table (kept for reference, not actively used in relationships)
+class QueryPaper(Base):
+    __tablename__ = "query_papers"
+    
+    query_id = Column(Integer, ForeignKey("query_history.id", ondelete="CASCADE"), primary_key=True, index=True)
+    paper_id = Column(Integer, ForeignKey("papers.id", ondelete="CASCADE"), primary_key=True, index=True)
+    
+    def __repr__(self):
+        return f"<QueryPaper(query_id={self.query_id}, paper_id={self.paper_id})>"
+
+
+# ✅ Archive table for soft deletes
+class PaperArchive(Base):
+    __tablename__ = "paper_archive"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    original_paper_id = Column(Integer, nullable=False)
+    paper_name = Column(String(255), nullable=False, index=True)
+    title = Column(String(500), nullable=False)
+    archived_at = Column(DateTime, default=datetime.utcnow, index=True)
+    archived_reason = Column(String(255), nullable=True)
+    
+    def __repr__(self):
+        return f"<PaperArchive(paper_name={self.paper_name}, archived_at={self.archived_at})>"
+
+
+# ========== DATABASE CONNECTION WITH POOLING ==========
+
+DATABASE_URL = settings.DATABASE_URL
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=settings.DB_POOL_SIZE,
+    max_overflow=settings.DB_MAX_OVERFLOW,
+    pool_pre_ping=True,
+    pool_recycle=3600,
+    echo=False
+)
+
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+def get_db():
+    """Dependency for FastAPI routes"""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def init_db():
+    """Create all tables with indexes"""
+    print("Creating database tables and indexes...")
+    Base.metadata.create_all(bind=engine)
+    print("✅ Database initialized with optimizations!")
+
+
+# ========== DATABASE INTEGRITY & MIGRATION ==========
+
+def check_database_integrity():
+    """Verify database integrity and fix issues"""
+    from sqlalchemy import text, func
+    db = SessionLocal()
+    issues = []
+    
+    try:
+        # Check 1: Papers without vector IDs but with embedding_generated=True
+        orphaned_chunks = db.query(Chunk).filter(
+            Chunk.embedding_generated == True,
+            Chunk.vector_id == None
+        ).count()
+        if orphaned_chunks > 0:
+            issues.append(f"Found {orphaned_chunks} chunks with orphaned vectors")
+        
+        # Check 2: Citations referencing non-existent papers
+        missing_citations = db.query(Citation).filter(
+            ~Citation.paper_id.in_(db.query(Paper.id))
+        ).count()
+        if missing_citations > 0:
+            issues.append(f"Found {missing_citations} citations with missing papers")
+        
+        # Check 3: Quality scores out of range
+        bad_scores = db.query(Paper).filter(
+            (Paper.quality_score < 0) | (Paper.quality_score > 1)
+        ).count()
+        if bad_scores > 0:
+            issues.append(f"Found {bad_scores} papers with invalid quality scores")
+        
+        # Check 4: Duplicate papers by paper_name
+        duplicate_papers = db.query(
+            Paper.paper_name,
+            func.count(Paper.id).label('count')
+        ).group_by(Paper.paper_name).having(
+            func.count(Paper.id) > 1
+        ).count()
+        if duplicate_papers > 0:
+            issues.append(f"Found {duplicate_papers} duplicate paper_names")
+        
+        if issues:
+            print("⚠️  Database integrity issues found:")
+            for issue in issues:
+                print(f"  - {issue}")
+            return False
+        else:
+            print("✅ Database integrity check passed")
+            return True
+    
+    finally:
+        db.close()
+
+
+def migrate_to_enhanced_schema():
+    """
+    Run migrations to add new columns if they don't exist
+    Use this for upgrading from old schema
+    """
+    from sqlalchemy import text
+    
+    print("Running database migrations...")
+    
+    migrations = [
+        # Add paper_name if missing
+        "ALTER TABLE papers ADD COLUMN paper_name VARCHAR(255) UNIQUE",
+        
+        # Add quality metrics if missing
+        "ALTER TABLE papers ADD COLUMN quality_score FLOAT DEFAULT 0.0",
+        "ALTER TABLE papers ADD COLUMN keywords JSONB DEFAULT '[]'",
+        "ALTER TABLE papers ADD COLUMN format_type VARCHAR(50) DEFAULT 'standard'",
+        
+        # Add section hierarchy if missing
+        "ALTER TABLE chunks ADD COLUMN section_id VARCHAR(50)",
+        "ALTER TABLE chunks ADD COLUMN section_level INTEGER DEFAULT 0",
+        
+        # Add timestamps if missing
+        "ALTER TABLE papers ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE papers ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE chunks ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE query_history ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE query_history ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE citations ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        
+        # Create indexes
+        "CREATE INDEX IF NOT EXISTS idx_paper_name ON papers(paper_name)",
+        "CREATE INDEX IF NOT EXISTS idx_quality_score ON papers(quality_score)",
+        "CREATE INDEX IF NOT EXISTS idx_section_id ON chunks(section_id)",
+        "CREATE INDEX IF NOT EXISTS idx_paper_chunk ON chunks(paper_id, chunk_index)",
+        "CREATE INDEX IF NOT EXISTS idx_confidence ON query_history(confidence)",
+        "CREATE INDEX IF NOT EXISTS idx_created_at_query ON query_history(created_at)",
+    ]
+    
+    with engine.connect() as conn:
+        for migration in migrations:
+            try:
+                conn.execute(text(migration))
+                print(f"✅ {migration[:60]}...")
+            except Exception as e:
+                if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
+                    print(f"⊘ Already exists: {migration[:60]}...")
+                else:
+                    print(f"❌ Migration failed: {migration[:60]}...")
+                    print(f"   Error: {str(e)[:100]}")
+        
+        conn.commit()
+    
+    print("✅ Database migrations complete")
+
+
+if __name__ == "__main__":
+    # Initialize database on first run
+    init_db()
+    
+    # Check integrity
+    check_database_integrity()
+    
+    # Run migrations if needed
+    try:
+        migrate_to_enhanced_schema()
+    except Exception as e:
+        print(f"Migrations may have already been applied: {e}")
+
+
+rotuers.py
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Query, Body
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+from typing import List, Optional
+import os
+import uuid
+import shutil
+import logging
+from datetime import datetime
+from pathlib import Path  # ✅ ADD THIS
+
+
+from src.models.database import Paper, Chunk, QueryHistory, Citation, QueryPaper, get_db
+from src.services.pdf_processor import pdf_processor
+from src.services.chunking_service import intelligent_chunker
+from src.services.embedding_service import embedding_service
+from src.services.qdrant_service import qdrant_service
+from src.services.cache_service import cache_service
+from src.services.rag_pipeline import RAGPipeline
+from src.config import settings
+
+
+logger = logging.getLogger(__name__)
+
+
+router = APIRouter(tags=["rag"])
+
+
+# Create uploads directory from settings
+os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
+
+
+
+# ========== HELPER FUNCTIONS ==========
+
+
+def get_rag_pipeline(db: Session) -> RAGPipeline:
+    """Factory function to instantiate RAGPipeline with dependencies"""
+    return RAGPipeline(
+        qdrant_service=qdrant_service,
+        embedding_service=embedding_service,
+        db_session=db,
+        model=getattr(settings, 'LLM_MODEL', 'deepseek-r1:8b')
+    )
+
+
+
+def _save_query_history(
+    db: Session,
+    query_text: str,
+    top_k: int,
+    response_time: float,
+    confidence: float,
+    answer: str = None,
+    paper_filter: Optional[List[int]] = None,
+    user_rating: Optional[int] = None
+) -> int:
+    """
+    Helper to save query to history for analytics
+    Matches QueryHistory model exactly
+    """
+    query_history = QueryHistory(
+        query_text=query_text,
+        answer=answer,
+        top_k=top_k,
+        response_time=response_time,
+        confidence=confidence,
+        paper_filter=paper_filter,  # ✅ CORRECT FIELD NAME
+        user_rating=user_rating
+    )
+    db.add(query_history)
+    db.commit()
+    db.refresh(query_history)
+    logger.info(f"✅ Query saved to history (ID={query_history.id})")
+    return query_history.id
+
+
+
+def _save_citations(
+    db: Session,
+    query_id: int,
+    rag_result: dict,
+    paper_title_to_id_map: dict,
+    paper_name_to_id_map: dict = None
+):
+    """Helper to save citations from RAG result to database"""
+    
+    # ✅ TRACK WHICH PAPERS WE'VE ALREADY CITED
+    cited_papers = set()
+    
+    for citation_data in rag_result.get('citations', []):
+        paper_title = citation_data.get('paper_title')
+        
+        paper_id = None
+        if paper_name_to_id_map and citation_data.get('paper_name'):
+            paper_id = paper_name_to_id_map.get(citation_data.get('paper_name'))
+        
+        if not paper_id:
+            paper_id = paper_title_to_id_map.get(paper_title)
+        
+        if not paper_id:
+            logger.warning(f"⚠️ Paper not found for citation: {paper_title}")
+            continue
+        
+        # ✅ SKIP IF WE ALREADY CITED THIS PAPER FOR THIS QUERY
+        if (query_id, paper_id) in cited_papers:
+            logger.info(f"⊘ Citation already exists for query {query_id}, paper {paper_id}")
+            continue
+        
+        try:
+            # ✅ Use get_or_create pattern to avoid duplicates
+            existing = db.query(Citation).filter(
+                Citation.query_id == query_id,
+                Citation.paper_id == paper_id
+            ).first()
+            
+            if existing:
+                # Update relevance score with highest value
+                existing.relevance_score = max(
+                    existing.relevance_score,
+                    citation_data.get('relevance_score', 0.0)
+                )
+                logger.info(f"⊘ Updated existing citation: query {query_id}, paper {paper_id}")
+            else:
+                # Create new citation
+                citation = Citation(
+                    query_id=query_id,
+                    paper_id=paper_id,
+                    chunk_id=None,
+                    relevance_score=citation_data.get('relevance_score', 0.0)
+                )
+                db.add(citation)
+                cited_papers.add((query_id, paper_id))
+        
+        except Exception as e:
+            logger.error(f"❌ Failed to save citation: {e}")
+    
+    db.commit()
+    logger.info(f"✅ Saved {len(cited_papers)} unique citations")
+
+
+
+# ========== DOCUMENT INGESTION SYSTEM ==========
+
+
+# src/api/routes.py - FIXED UPLOAD ENDPOINT
+
+@router.post("/papers/upload")
+async def upload(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
+    """Upload and process PDF with paper_name extraction from filename"""
+    
+    # Validate file
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files allowed")
+    
+    if file.size and file.size > settings.MAX_UPLOAD_SIZE * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large (max 50MB)")
+    
+    logger.info(f"📄 Uploading: {file.filename}")
+    
+    # ✅ EXTRACT PAPER_NAME FROM FILENAME (without extension)
+    paper_name = Path(file.filename).stem
+    logger.info(f"📝 Paper name extracted: {paper_name}")
+    
+    # ✅ CHECK FOR DUPLICATES BY BOTH paper_name AND filename
+    existing_by_name = db.query(Paper).filter(Paper.paper_name == paper_name).first()
+    existing_by_filename = db.query(Paper).filter(Paper.filename == file.filename).first()
+    
+    if existing_by_name or existing_by_filename:
+        existing = existing_by_name or existing_by_filename
+        logger.warning(f"⚠️ Paper already exists: {paper_name} (ID={existing.id})")
+        return {
+            "paper_id": existing.id,
+            "paper_name": existing.paper_name,
+            "title": existing.title,
+            "status": "already_exists",
+            "message": "This paper was already uploaded",
+            "uploaded": existing.upload_date.isoformat()
+        }
+    
+    file_path = os.path.join(settings.UPLOAD_DIR, str(uuid.uuid4()) + ".pdf")
+
+    try:
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+        logger.error(f"❌ File save failed: {e}")
+        raise HTTPException(status_code=500, detail=f"File save failed: {str(e)}")
+    
+    # Process PDF
+    try:
+        processed_doc = pdf_processor.process_document(file_path)
+        if not processed_doc:
+            os.remove(file_path)
+            logger.error("PDF processing returned None")
+            raise HTTPException(status_code=500, detail="PDF processing failed")
+    except Exception as e:
+        os.remove(file_path)
+        logger.error(f"❌ PDF processing failed: {e}")
+        raise HTTPException(status_code=500, detail=f"PDF processing failed: {str(e)}")
+    
+    try:
+        # ✅ SAVE PAPER WITH PAPER_NAME AND ALL METADATA
+ # ...
+        paper = Paper(
+            paper_name=paper_name,
+            title=processed_doc.title or "Unknown",
+            authors=processed_doc.authors or [],
+            year=processed_doc.year,
+            filename=file.filename,
+            file_path=file_path,
+            total_pages=processed_doc.total_pages or 0,
+            abstract=processed_doc.abstract or "",
+            sections=[
+                {
+                    "name": section.name,
+                    "page_start": section.page_start,
+                    "page_end": section.page_end,
+                    "section_id": getattr(section, "section_id", None),
+                    "level": getattr(section, "level", 0),
+                }
+                for section in processed_doc.sections
+            ] if processed_doc.sections else [],
+            quality_score=processed_doc.quality_metrics.get('overall_quality', 0),
+            keywords=processed_doc.keywords or [],
+            format_type=processed_doc.format_type or "standard",
+            processed=False
+        )
+
+        db.add(paper)
+        db.commit()
+        db.refresh(paper)
+        logger.info(f"✅ Paper saved: ID={paper.id}, paper_name={paper_name}, quality={paper.quality_score:.2f}")
+    except Exception as e:
+        db.rollback()
+        os.remove(file_path)
+        logger.error(f"❌ Failed to save paper: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save paper: {str(e)}")
+    
+    # Step 1: Create chunks with BATCH COMMITS
+    chunk_count = 0
+    try:
+        for section in processed_doc.sections:
+            chunks = intelligent_chunker.chunk_section(
+                section_text=section.text,
+                section_name=section.name,
+                page_start=section.page_start,
+                page_end=section.page_end,
+                paper_name=paper_name,  # ✅ ADD THIS
+                section_id=section.section_id,  # ✅ ADD THIS
+                section_level=section.level  # ✅ ADD THIS
+            )
+            
+            for chunk in chunks:
+                db_chunk = Chunk(
+                    paper_id=paper.id,
+                    chunk_index=chunk.chunk_index,
+                    text=chunk.text,
+                    section=chunk.section,
+                    page_number=chunk.page_number,
+                    section_id=chunk.section_id,  # ✅ ADD THIS
+                    section_level=chunk.section_level  # ✅ ADD THIS
+                )
+                db.add(db_chunk)
+                chunk_count += 1
+                
+                # BATCH COMMIT: Every 10 chunks
+                if chunk_count % 10 == 0:
+                    db.commit()
+                    logger.info(f"✅ Committed {chunk_count} chunks...")
+        
+        db.commit()
+        logger.info(f"✅ All {chunk_count} chunks committed")
+    except Exception as e:
+        db.rollback()
+        logger.error(f"❌ Chunk creation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Chunk creation failed: {str(e)}")
+    
+    # Step 2: Get chunk IDs from database
+    try:
+        db_chunks = db.query(Chunk).filter(Chunk.paper_id == paper.id).all()
+        logger.info(f"✅ Retrieved {len(db_chunks)} chunks from database")
+        
+        if not db_chunks:
+            logger.warning(f"⚠️ No chunks retrieved for paper {paper_name}")
+        
+        chunk_dicts = [
+            {
+                'id': c.id,
+                'text': c.text,
+                'section': c.section,
+                'page_number': c.page_number,
+                'paper_name': paper_name,  # ✅ ADD THIS
+                'section_id': c.section_id,  # ✅ ADD THIS
+                'section_level': c.section_level  # ✅ ADD THIS
+            }
+            for c in db_chunks
+        ]
+    except Exception as e:
+        logger.error(f"❌ Failed to retrieve chunks: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve chunks: {str(e)}")
+    
+    # Step 3: Generate embeddings
+    try:
+        embedding_texts = [c['text'] for c in chunk_dicts]
+        embeddings = embedding_service.encode_batch(embedding_texts)
+        logger.info(f"✅ Generated {len(embeddings)} embeddings")
+    except Exception as e:
+        logger.error(f"❌ Embedding failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Embedding generation failed: {str(e)}")
+    
+    # Step 4: Store in Qdrant
+    try:
+        vector_ids = qdrant_service.upsert_chunks(chunk_dicts, embeddings, paper.id)
+        logger.info(f"✅ Stored {len(vector_ids)} vectors in Qdrant")
+    except Exception as e:
+        logger.error(f"❌ Qdrant storage failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Vector storage failed: {str(e)}")
+    
+    # Step 5: Update vector IDs
+    try:
+        for db_chunk, vector_id in zip(db_chunks, vector_ids):
+            db_chunk.vector_id = vector_id
+            db_chunk.embedding_generated = True
+        
+        db.commit()
+        logger.info(f"✅ Updated {len(db_chunks)} vector IDs")
+    except Exception as e:
+        db.rollback()
+        logger.error(f"❌ Failed to update vector IDs: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update vector IDs: {str(e)}")
+    
+    # Step 6: Mark as processed
+    try:
+        paper.processed = True
+        paper.chunk_count = len(db_chunks)
+        db.commit()
+        logger.info(f"✅ Paper marked as processed")
+    except Exception as e:
+        db.rollback()
+        logger.error(f"❌ Failed to mark paper as processed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to mark paper as processed: {str(e)}")
+    
+    logger.info(f"✅ Upload complete: {len(db_chunks)} chunks, quality={paper.quality_score:.2f}")
+    
+    return {
+        "paper_id": paper.id,
+        "paper_name": paper_name,  # ✅ ADD THIS
+        "title": paper.title,
+        "authors": paper.authors,
+        "year": paper.year,
+        "keywords": paper.keywords,  # ✅ ADD THIS
+        "quality_score": paper.quality_score,  # ✅ ADD THIS
+        "format_type": paper.format_type,  # ✅ ADD THIS
+        "sections_extracted": len(processed_doc.sections),
+        "chunks_created": len(db_chunks),
+        "pages": paper.total_pages,
+        "upload_status": "success",
+        "message": f"Successfully uploaded and processed {paper_name}"
+    }
+
+
+
+# ========== RAG QUERY SYSTEM ==========
+
+
+@router.post("/query")
+async def rag_query(
+    question: str = Query(..., min_length=3, max_length=500, description="User question"),
+    top_k: int = Query(5, ge=1, le=20, description="Number of chunks to retrieve"),
+    paper_ids: Optional[List[int]] = Query(None, description="Optional: filter by paper IDs"),
+    use_cache: bool = Query(True, description="Enable response caching"),
+    db: Session = Depends(get_db)
+):
+    """🚀 Full RAG-Powered Query Endpoint with paper_name in sources"""
+    logger.info(f"🔍 RAG Query: {question[:50]}...")
+    
+    if use_cache:
+        cached = cache_service.get_query_cache(question, paper_ids)
+        if cached:
+            logger.info("✅ Cache hit")
+            cached['cached'] = True
+            return cached
+    
+    try:
+        rag_pipeline = get_rag_pipeline(db)
+        rag_result = rag_pipeline.generate_answer(question=question, top_k=top_k, paper_ids=paper_ids)
+        
+        # ✅ CREATE PAPER_NAME MAPPING
+        paper_title_to_id_map = {}
+        paper_title_to_name_map = {}
+        
+        for citation_data in rag_result.get('citations', []):
+            paper_title = citation_data.get('paper_title')
+            paper = db.query(Paper).filter(Paper.title == paper_title).first()
+            if paper:
+                paper_title_to_id_map[paper_title] = paper.id
+                paper_title_to_name_map[paper_title] = paper.paper_name
+        
+        query_id = _save_query_history(
+            db=db, query_text=question, top_k=top_k,
+            response_time=rag_result['response_time'],
+            confidence=rag_result['confidence'],
+            answer=rag_result['answer'],
+            paper_filter=paper_ids
+        )
+        
+        _save_citations(db, query_id, rag_result, paper_title_to_id_map)
+        
+        # ✅ UPDATE sources_used to use paper_name
+        rag_result['sources_used'] = list(set(
+            paper_title_to_name_map.get(c.get('paper_title'), c.get('paper_title'))
+            for c in rag_result.get('citations', [])
+        ))
+        
+        # ✅ UPDATE citations to use paper_name
+        for citation in rag_result.get('citations', []):
+            paper_title = citation.get('paper_title')
+            paper_name = paper_title_to_name_map.get(paper_title, paper_title)
+            citation['paper_name'] = paper_name
+        
+        if use_cache:
+            cache_service.set_query_cache(question, rag_result, paper_ids)
+        
+        rag_result['cached'] = False
+        logger.info(f"✅ Query answered in {rag_result['response_time']}s. Sources: {rag_result['sources_used']}")
+        return rag_result
+        
+    except Exception as e:
+        logger.error(f"❌ RAG query failed: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
+
+
+ 
+
+
+@router.post("/query/batch")
+async def rag_query_batch(
+    questions: List[str] = Body(..., min_items=1, max_items=10),
+    top_k: int = Body(5, ge=1, le=20),
+    paper_ids: Optional[List[int]] = Body(None),
+    db: Session = Depends(get_db)
+):
+    """⚡ Batch RAG Query Processing with paper_name in sources"""
+    logger.info(f"⚡ Processing batch of {len(questions)} queries")
+    
+    results = []
+    rag_pipeline = get_rag_pipeline(db)
+    
+    # ✅ CREATE PAPER_NAME MAPPING ONCE
+    paper_title_to_id_map = {}
+    paper_title_to_name_map = {}
+    all_papers = db.query(Paper).all()
+    for paper in all_papers:
+        paper_title_to_id_map[paper.title] = paper.id
+        paper_title_to_name_map[paper.title] = paper.paper_name
+    
+    for idx, question in enumerate(questions, 1):
+        try:
+            logger.info(f"Processing query {idx}/{len(questions)}")
+            result = rag_pipeline.generate_answer(question=question, top_k=top_k, paper_ids=paper_ids)
+            
+            query_id = _save_query_history(
+                db=db, query_text=question, top_k=top_k,
+                response_time=result['response_time'],
+                confidence=result['confidence'],
+                answer=result['answer'],
+                paper_filter=paper_ids
+            )
+            
+            _save_citations(db, query_id, result, paper_title_to_id_map)
+            
+            # ✅ UPDATE sources_used
+            result['sources_used'] = list(set(
+                paper_title_to_name_map.get(c.get('paper_title'), c.get('paper_title'))
+                for c in result.get('citations', [])
+            ))
+            
+            # ✅ UPDATE citations
+            for citation in result.get('citations', []):
+                paper_title = citation.get('paper_title')
+                paper_name = paper_title_to_name_map.get(paper_title, paper_title)
+                citation['paper_name'] = paper_name
+            
+            result['question'] = question
+            result['batch_index'] = idx
+            result['success'] = True
+            results.append(result)
+            
+        except Exception as e:
+            logger.error(f"Failed to process query {idx}: {str(e)}")
+            results.append({
+                "question": question,
+                "batch_index": idx,
+                "error": str(e),
+                "success": False
+            })
+    
+    logger.info(f"✅ Batch processing complete: {len(results)} results")
+    return {
+        "total_queries": len(questions),
+        "successful": sum(1 for r in results if r.get('success', True)),
+        "results": results
+    }
+
+
+
+
+@router.get("/papers")
+async def list_papers(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=100),
+    min_quality: Optional[float] = Query(None, ge=0, le=1, description="Filter by minimum quality"),  # ✅ ADD
+    db: Session = Depends(get_db)
+):
+    """List all uploaded papers with pagination and quality filtering"""
+    query = db.query(Paper)
+    
+    # ✅ ADD QUALITY FILTERING
+    if min_quality is not None:
+        query = query.filter(Paper.quality_score >= min_quality)
+    
+    papers = query.offset(skip).limit(limit).all()
+    total = query.count()
+    
+    return {
+        "papers": [
+            {
+                "id": p.id,
+                "paper_name": p.paper_name,  # ✅ ADD THIS
+                "title": p.title,
+                "authors": p.authors,
+                "year": p.year,
+                "pages": p.total_pages,
+                "chunks": p.chunk_count,
+                "quality_score": p.quality_score,  # ✅ ADD THIS
+                "keywords": p.keywords,  # ✅ ADD THIS
+                "processed": p.processed,
+                "uploaded": p.upload_date.isoformat()
+            }
+            for p in papers
+        ],
+        "total": total,
+        "skip": skip,
+        "limit": limit
+    }
+
+
+
+@router.get("/papers/{paper_id}")
+async def get_paper(paper_id: int, db: Session = Depends(get_db)):
+    """Get detailed paper information"""
+    paper = db.query(Paper).filter(Paper.id == paper_id).first()
+    
+    if not paper:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    
+    return {
+        "id": paper.id,
+        "paper_name": paper.paper_name,  # ✅ ADD THIS
+        "title": paper.title,
+        "authors": paper.authors,
+        "year": paper.year,
+        "keywords": paper.keywords,  # ✅ ADD THIS
+        "quality_score": paper.quality_score,  # ✅ ADD THIS
+        "abstract": paper.abstract,
+        "sections": paper.sections,
+        "pages": paper.total_pages,
+        "chunks": paper.chunk_count,
+        "processed": paper.processed,
+        "uploaded": paper.upload_date.isoformat()
+    }
+
+
+
+@router.delete("/papers/{paper_id}")
+async def delete_paper(paper_id: int, db: Session = Depends(get_db)):
+    """Remove paper + vectors from Qdrant + chunks from database"""
+    paper = db.query(Paper).filter(Paper.id == paper_id).first()
+    
+    if not paper:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    
+    try:
+        qdrant_service.delete_by_paper(paper_id)
+    except Exception as e:
+        logger.warning(f"Qdrant deletion failed: {e}")
+    
+    db.delete(paper)
+    db.commit()
+    
+    logger.info(f"✅ Paper deleted: {paper.title}")
+    
+    return {
+        "id": paper_id,
+        "paper_name": paper.paper_name,  # ✅ ADD THIS
+        "status": "deleted",
+        "title": paper.title
+    }
+
+
+
+@router.get("/papers/{paper_id}/stats")
+async def paper_stats(paper_id: int, db: Session = Depends(get_db)):
+    """View paper statistics"""
+    paper = db.query(Paper).filter(Paper.id == paper_id).first()
+    
+    if not paper:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    
+    citations_count = db.query(Citation).filter(Citation.paper_id == paper_id).count()
+    
+    from sqlalchemy import func
+    query_count = db.query(func.count(QueryHistory.id)).filter(
+        text(f"paper_filter::text LIKE '%{paper_id}%'")
+    ).scalar() or 0
+    
+    return {
+        "paper_id": paper_id,
+        "paper_name": paper.paper_name,  # ✅ ADD THIS
+        "title": paper.title,
+        "quality_score": paper.quality_score,  # ✅ ADD THIS
+        "keywords": paper.keywords,  # ✅ ADD THIS
+        "chunks_created": paper.chunk_count,
+        "times_cited": citations_count,
+        "times_queried": query_count,
+        "pages": paper.total_pages,
+        "uploaded": paper.upload_date.isoformat()
+    }
+
+
+
+@router.get("/queries/history")
+async def queries_history(
+    limit: int = Query(10, ge=1, le=100),
+    db: Session = Depends(get_db)
+):
+    """Recent queries with response times"""
+    queries = db.query(QueryHistory).order_by(
+        QueryHistory.timestamp.desc()
+    ).limit(limit).all()
+    
+    return {
+        "queries": [
+            {
+                "id": q.id,
+                "query": q.query_text,
+                "answer_preview": q.answer[:200] if q.answer else None,
+                "response_time_ms": round(q.response_time * 1000, 2) if q.response_time else None,
+                "confidence": q.confidence,
+                "user_rating": q.user_rating,
+                "paper_filter": q.paper_filter,
+                "timestamp": q.timestamp.isoformat()
+            }
+            for q in queries
+        ],
+        "total": len(queries)
+    }
+
+
+
+@router.get("/analytics/popular")
+async def analytics_popular(
+    limit: int = Query(10, ge=1, le=100),
+    db: Session = Depends(get_db)
+):
+    """Most frequently asked questions"""
+    from sqlalchemy import func
+    
+    popular = db.query(
+        QueryHistory.query_text,
+        func.count(QueryHistory.id).label('count'),
+        func.avg(QueryHistory.confidence).label('avg_confidence')
+    ).group_by(QueryHistory.query_text).order_by(
+        func.count(QueryHistory.id).desc()
+    ).limit(limit).all()
+    
+    return {
+        "popular_queries": [
+            {
+                "query": q[0],
+                "count": q[1],
+                "avg_confidence": round(q[2], 3) if q[2] else 0
+            }
+            for q in popular
+        ],
+        "total_queries": db.query(QueryHistory).count()
+    }
+
+
+
+@router.get("/analytics/papers")
+async def analytics_papers(db: Session = Depends(get_db)):
+    """Paper usage statistics with paper_name"""
+    from sqlalchemy import func
+    
+    stats = db.query(
+        Paper.id,
+        Paper.paper_name,  # ✅ ADD THIS
+        Paper.title,
+        Paper.quality_score,  # ✅ ADD THIS
+        func.count(Citation.id).label('citations')
+    ).outerjoin(Citation, Paper.id == Citation.paper_id).group_by(
+        Paper.id
+    ).all()
+    
+    return {
+        "paper_stats": [
+            {
+                "id": s[0],
+                "paper_name": s[1],  # ✅ ADD THIS
+                "title": s[2],
+                "quality_score": s[3],  # ✅ ADD THIS
+                "times_cited": s[4] or 0
+            }
+            for s in stats
+        ]
+    }
+
+
+
+@router.get("/analytics/performance")
+async def analytics_performance(db: Session = Depends(get_db)):
+    """System performance metrics"""
+    from sqlalchemy import func
+    
+    queries = db.query(QueryHistory).all()
+    
+    if not queries:
+        return {
+            "total_queries": 0,
+            "avg_response_time_ms": 0,
+            "avg_confidence": 0,
+            "avg_user_rating": None,
+            "avg_extraction_quality": None  # ✅ ADD THIS
+        }
+    
+    avg_time = sum(q.response_time or 0 for q in queries) / len(queries)
+    avg_conf = sum(q.confidence or 0 for q in queries) / len(queries)
+    
+    rated_queries = [q for q in queries if q.user_rating is not None]
+    avg_rating = sum(q.user_rating for q in rated_queries) / len(rated_queries) if rated_queries else None
+    
+    # ✅ ADD EXTRACTION QUALITY
+    papers = db.query(Paper).all()
+    avg_extraction_quality = (
+        sum(p.quality_score for p in papers) / len(papers)
+        if papers else None
+    )
+    
+    return {
+        "total_queries": len(queries),
+        "total_papers": db.query(Paper).count(),
+        "total_chunks": db.query(Chunk).count(),
+        "avg_response_time_ms": round(avg_time * 1000, 2),
+        "avg_confidence": round(avg_conf, 3),
+        "avg_user_rating": round(avg_rating, 2) if avg_rating else None,
+        "rated_responses_count": len(rated_queries),
+        "avg_extraction_quality": round(avg_extraction_quality, 3) if avg_extraction_quality else None  # ✅ ADD THIS
+    }
+
+
+
+@router.get("/health")
+async def health():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "services": {
+            "api": "running",
+            "pdf_processor": "enhanced",  # ✅ UPDATED
+            "chunking": "enhanced",  # ✅ UPDATED
+            "embedding": "ready",
+            "qdrant": "ready",
+            "cache": "ready",
+            "rag_pipeline": "ready"
+        }
+    }
+
+
+
+@router.get("/")
+async def root():
+    """Welcome message with API documentation"""
+    return {
+        "message": "🚀 Research Paper RAG System",
+        "version": "2.1",  # ✅ UPDATED
+        "features_enhanced": [  # ✅ ADD THIS
+            "Paper name extraction from PDF filenames",
+            "Quality score tracking for extraction accuracy",
+            "Automatic keywords and citation extraction",
+            "Section hierarchy detection (2.1, 3.2.1, etc.)",
+            "Format type classification (standard/report/commentary)"
+        ],
+        "endpoints": {
+            "document_ingestion": {
+                "upload_paper": "POST /api/papers/upload"
+            },
+            "rag_queries": {
+                "basic_rag_query": "POST /api/query (with query params)",
+                
+                "batch_rag_query": "POST /api/query/batch"
+            },
+            "paper_management": {
+                "list_papers": "GET /api/papers (with quality filter)",  # ✅ UPDATED
+                "get_paper_details": "GET /api/papers/{paper_id}",
+                "delete_paper": "DELETE /api/papers/{paper_id}",
+                "paper_statistics": "GET /api/papers/{paper_id}/stats"
+            },
+            "analytics": {
+                "query_history": "GET /api/queries/history",
+                "popular_queries": "GET /api/analytics/popular",
+                "paper_usage": "GET /api/analytics/papers",
+                "performance_metrics": "GET /api/analytics/performance"
+            },
+            "system": {
+                "health_check": "GET /api/health",
+                "documentation": "GET /docs",
+                "openapi_schema": "GET /openapi.json"
+            }
+        },
+        "features": [
+            "Semantic search with vector embeddings",
+            "LLM-powered answer generation",
+            "Automatic citation extraction and storage",
+            "Query result caching",
+            "Batch query processing",
+            "User rating system",
+            "Comprehensive analytics and performance tracking",
+            "✅ Paper name based source tracking",
+            "✅ Extraction quality metrics",
+            "✅ Section hierarchy support"
+        ]
+    }
+
+
+//cach_service.py
+import redis
+import json
+import hashlib
+from typing import Dict, Optional, List
+import logging
+from src.config import settings
+
+logger = logging.getLogger(__name__)
+
+class CacheService:
+    """
+    Redis caching service for query results
+    
+    Benefits:
+    - 70% latency improvement for repeat queries
+    - 1 hour TTL (configurable)
+    - Reduces LLM calls
+    - Optional (works without Redis)
+    """
+    
+    def __init__(self, host: str = settings.REDIS_HOST, port: int = settings.REDIS_PORT, ttl: int = settings.CACHE_TTL):
+        try:
+            self.redis = redis.Redis(host=host, port=port, decode_responses=True)
+            self.redis.ping()
+            self.ttl = ttl
+            logger.info("✅ Redis cache connected")
+        except Exception as e:
+            self.redis = None
+            logger.warning(f"⚠️ Redis unavailable (cache disabled): {e}")
+    
+    def get_query_cache(self, question: str, 
+                       paper_ids: Optional[List[int]] = None) -> Optional[Dict]:
+        """Get cached query result"""
+        if not self.redis:
+            return None
+        
+        try:
+            cache_key = self._generate_key(question, paper_ids)
+            cached = self.redis.get(cache_key)
+            if cached:
+                logger.info(f"Cache hit: {question[:50]}")
+                return json.loads(cached)
+            return None
+        except Exception as e:
+            logger.warning(f"Cache get failed: {e}")
+            return None
+    
+    def set_query_cache(self, question: str, result: Dict, 
+                       paper_ids: Optional[List[int]] = None):
+        """Cache query result"""
+        if not self.redis:
+            return
+        
+        try:
+            cache_key = self._generate_key(question, paper_ids)
+            self.redis.setex(cache_key, self.ttl, json.dumps(result))
+            logger.info(f"Cached query: {question[:50]}")
+        except Exception as e:
+            logger.warning(f"Cache set failed: {e}")
+    
+    def _generate_key(self, question: str, 
+                     paper_ids: Optional[List[int]]) -> str:
+        """Generate cache key from question and paper IDs"""
+        key_str = f"{question}:{sorted(paper_ids) if paper_ids else 'all'}"
+        return f"query:{hashlib.md5(key_str.encode()).hexdigest()}"
+
+
+# ✅ Global instance for easy import
+cache_service = CacheService()
+
+//chunking_service.py
+from typing import List, Dict, Optional
+from dataclasses import dataclass, field
+from transformers import AutoTokenizer
+import re
+import logging
+import os
+from src.config import settings
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Chunk:
+    """Represents a text chunk with enhanced metadata"""
+    text: str
+    section: str
+    page_number: int
+    chunk_index: int
+    metadata: Dict = field(default_factory=dict)
+    
+    paper_name: Optional[str] = None  # From PDF filename
+    section_id: Optional[str] = None  # e.g., "2.1"
+    section_level: int = 0  # 0=main, 1=sub, 2=subsub
+
+
+class IntelligentChunker:
+    """
+    Production-grade intelligent chunking for research papers with paper_name tracking
+    """
+    
+    def __init__(self, 
+                 model_name: str = settings.EMBEDDING_MODEL,
+                 chunk_size: int = settings.CHUNK_SIZE,
+                 overlap: int = settings.CHUNK_OVERLAP):
+        self.chunk_size = chunk_size
+        self.overlap = overlap
+        
+        if os.getenv('HF_HUB_OFFLINE') == '1' or os.getenv('TRANSFORMERS_OFFLINE') == '1':
+            self.tokenizer = None
+            logger.info("Offline mode enabled; using word-based token estimation.")
+        else:
+            try:
+                hf_token = os.getenv('HUGGING_FACE_HUB_TOKEN') or os.getenv('HUGGINGFACE_HUB_TOKEN')
+                try:
+                    # Prefer full repo id first
+                    self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
+                except TypeError:
+                    # Older transformers versions use use_auth_token
+                    self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_auth_token=hf_token)
+                logger.info(f"✅ Loaded tokenizer: {model_name}")
+            except Exception as e:
+                # Fallback to normalized name if the full repo id isn't a tokenizer repo
+                try:
+                    normalized_name = model_name.replace('sentence-transformers/', '')
+                    try:
+                        self.tokenizer = AutoTokenizer.from_pretrained(normalized_name, token=hf_token)
+                    except TypeError:
+                        self.tokenizer = AutoTokenizer.from_pretrained(normalized_name, use_auth_token=hf_token)
+                    logger.info(f"✅ Loaded tokenizer (fallback): {normalized_name}")
+                except Exception:
+                    logger.warning(f"Failed to load tokenizer: {e}. Falling back to word estimation.")
+                    self.tokenizer = None
+    
+    def estimate_tokens(self, text: str) -> int:
+        """Accurate token estimation"""
+        if self.tokenizer:
+            return len(self.tokenizer.encode(text, add_special_tokens=False))
+        else:
+            return int(len(text.split()) * 1.3)
+    
+    def split_into_sentences(self, text: str) -> List[str]:
+        """Split text into sentences, preserving academic formatting"""
+        sentences = re.split(
+            r'(?<!\d)\.(?!\d)(?!\s*al\.)(?!\s*Fig\.)(?!\s*Tab\.)(?!\s*Eq\.)'
+            r'(?!\s*Dr\.)(?!\s*Prof\.)(?!\s*Inc\.)(?!\s*Ltd\.)(?!\s*etc\.)\s+',
+            text
+        )
+        return [s.strip() for s in sentences if s.strip()]
+    
+    def chunk_section(self, 
+                     section_text: str, 
+                     section_name: str, 
+                     page_start: int, 
+                     page_end: int,
+                     paper_name: Optional[str] = None,  # ✅ ADD THIS
+                     section_id: Optional[str] = None,  # ✅ ADD THIS
+                     section_level: int = 0  # ✅ ADD THIS
+                     ) -> List[Chunk]:
+        """
+        Create optimally-sized chunks from a section with paper_name tracking
+        
+        Args:
+            section_text: Text to chunk
+            section_name: Section name
+            page_start: Starting page
+            page_end: Ending page
+            paper_name: ✅ NEW: PDF filename (e.g., "lwe_optimization_2024")
+            section_id: ✅ NEW: Section numbering (e.g., "2.1")
+            section_level: ✅ NEW: Hierarchy level (0=main, 1=sub)
+        """
+        sentences = self.split_into_sentences(section_text)
+        chunks = []
+        current_chunk = []
+        current_tokens = 0
+        chunk_index = 0
+        
+        for sentence in sentences:
+            sentence_tokens = self.estimate_tokens(sentence)
+            
+            if sentence_tokens > self.chunk_size:
+                logger.warning(f"Long sentence ({sentence_tokens} tokens) in {section_name}")
+                if self.tokenizer:
+                    tokens = self.tokenizer.encode(sentence, add_special_tokens=False)
+                    for i in range(0, len(tokens), self.chunk_size - self.overlap):
+                        chunk_tokens = tokens[i:i + self.chunk_size]
+                        chunk_text = self.tokenizer.decode(chunk_tokens)
+                        chunks.append(Chunk(
+                            text=chunk_text,
+                            section=section_name,
+                            page_number=page_start,
+                            chunk_index=chunk_index,
+                            metadata={
+                                'token_count': len(chunk_tokens),
+                                'is_partial_sentence': True,
+                                'warning': 'sentence_too_long'
+                            },
+                            paper_name=paper_name,  # ✅ ADD THIS
+                            section_id=section_id,  # ✅ ADD THIS
+                            section_level=section_level  # ✅ ADD THIS
+                        ))
+                        chunk_index += 1
+                else:
+                    chunks.append(Chunk(
+                        text=sentence,
+                        section=section_name,
+                        page_number=page_start,
+                        chunk_index=chunk_index,
+                        metadata={
+                            'token_count': sentence_tokens,
+                            'is_partial_sentence': True,
+                            'warning': 'long_sentence_no_tokenizer'
+                        },
+                        paper_name=paper_name,  # ✅ ADD THIS
+                        section_id=section_id,  # ✅ ADD THIS
+                        section_level=section_level  # ✅ ADD THIS
+                    ))
+                    chunk_index += 1
+                continue
+            
+            if current_tokens + sentence_tokens > self.chunk_size and current_chunk:
+                chunk_text = ' '.join(current_chunk)
+                chunks.append(Chunk(
+                    text=chunk_text,
+                    section=section_name,
+                    page_number=page_start,
+                    chunk_index=chunk_index,
+                    metadata={
+                        'token_count': current_tokens,
+                        'sentence_count': len(current_chunk),
+                        'is_complete': True
+                    },
+                    paper_name=paper_name,  # ✅ ADD THIS
+                    section_id=section_id,  # ✅ ADD THIS
+                    section_level=section_level  # ✅ ADD THIS
+                ))
+                
+                overlap_sentences = []
+                overlap_tokens = 0
+                for s in reversed(current_chunk):
+                    s_tokens = self.estimate_tokens(s)
+                    if overlap_tokens + s_tokens <= self.overlap:
+                        overlap_sentences.insert(0, s)
+                        overlap_tokens += s_tokens
+                    else:
+                        break
+                
+                current_chunk = overlap_sentences + [sentence]
+                current_tokens = sum(self.estimate_tokens(s) for s in current_chunk)
+                chunk_index += 1
+            else:
+                current_chunk.append(sentence)
+                current_tokens += sentence_tokens
+        
+        if current_chunk:
+            chunk_text = ' '.join(current_chunk)
+            chunks.append(Chunk(
+                text=chunk_text,
+                section=section_name,
+                page_number=page_start,
+                chunk_index=chunk_index,
+                metadata={
+                    'token_count': current_tokens,
+                    'sentence_count': len(current_chunk),
+                    'is_final': True
+                },
+                paper_name=paper_name,  # ✅ ADD THIS
+                section_id=section_id,  # ✅ ADD THIS
+                section_level=section_level  # ✅ ADD THIS
+            ))
+        
+        avg_tokens = sum(c.metadata['token_count'] for c in chunks) / len(chunks) if chunks else 0
+        logger.info(
+            f"Created {len(chunks)} chunks from '{section_name}' "
+            f"(avg {avg_tokens:.0f} tokens/chunk) | "  # ✅ ADD THIS
+            f"paper: {paper_name} | section_id: {section_id}"  # ✅ ADD THIS
+        )
+        
+        return chunks
+
+
+# ✅ Global instance for easy import
+intelligent_chunker = IntelligentChunker()
+
+
+//embedding_service.py
+from typing import List
+import numpy as np
+import logging
+import os
+from src.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+class EmbeddingService:
+    """
+    SentenceTransformer Embedding Service
+    Encodes text to dense vector embeddings for semantic search
+    """
+    
+    def __init__(
+        self, 
+        model_name: str = None,
+        dimension: int = None,
+        batch_size: int = None
+    ):
+        """
+        Initialize EmbeddingService
+        
+        Args:
+            model_name: HuggingFace model name (default: from settings)
+            dimension: Embedding dimension (default: from settings)
+            batch_size: Batch size for encoding (default: from settings)
+        """
+        self.model_name = model_name or settings.EMBEDDING_MODEL
+        self.dimension = dimension or settings.EMBEDDING_DIMENSION
+        self.batch_size = batch_size or settings.EMBEDDING_BATCH_SIZE
+        self.model = None
+        
+        # Set HuggingFace token
+        hf_token = settings.HUGGING_FACE_HUB_TOKEN
+        if hf_token:
+            os.environ['HUGGINGFACE_HUB_TOKEN'] = hf_token
+            logger.info("✅ HuggingFace token configured")
+        else:
+            logger.warning("⚠️ No HuggingFace token provided - may fail for private models")
+        
+        # Load model on initialization
+        self._load_model()
+    
+    def _load_model(self):
+        """Load SentenceTransformer model"""
+        if self.model is not None:
+            return
+        
+        try:
+            from sentence_transformers import SentenceTransformer
+            
+            logger.info(f"📥 Loading model: {self.model_name}")
+            self.model = SentenceTransformer(self.model_name)
+            logger.info(f"✅ Model loaded successfully (dimension: {self.dimension})")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to load model: {type(e).__name__}: {str(e)}")
+            raise RuntimeError(f"Cannot load embedding model: {str(e)}")
+    
+    def encode_single(self, text: str) -> np.ndarray:
+        """
+        Encode single text to embedding vector
+        
+        Args:
+            text: Input text to encode
+            
+        Returns:
+            np.ndarray: Normalized embedding of shape (dimension,)
+        """
+        if self.model is None:
+            self._load_model()
+        
+        try:
+            embedding = self.model.encode(
+                text,
+                convert_to_numpy=True,
+                normalize_embeddings=True
+            )
+            logger.debug(f"✅ Encoded text: {text[:50]}...")
+            return embedding
+            
+        except Exception as e:
+            logger.error(f"❌ Encoding failed: {str(e)}")
+            raise RuntimeError(f"Failed to encode text: {str(e)}")
+    
+    def encode_batch(self, texts: List[str], show_progress: bool = False) -> np.ndarray:
+        """
+        Encode batch of texts to embeddings
+        
+        Args:
+            texts: List of text strings to encode
+            show_progress: Show progress bar during encoding
+            
+        Returns:
+            np.ndarray: Array of embeddings with shape (len(texts), dimension)
+        """
+        if self.model is None:
+            self._load_model()
+        
+        if not texts:
+            logger.warning("⚠️ Empty text list provided")
+            return np.array([])
+        
+        try:
+            logger.info(f"📥 Encoding batch of {len(texts)} texts (batch_size: {self.batch_size})")
+            
+            embeddings = self.model.encode(
+                texts,
+                batch_size=self.batch_size,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                show_progress_bar=show_progress
+            )
+            
+            logger.info(f"✅ Batch encoding complete. Shape: {embeddings.shape}")
+            return embeddings
+            
+        except Exception as e:
+            logger.error(f"❌ Batch encoding failed: {str(e)}")
+            raise RuntimeError(f"Failed to encode batch: {str(e)}")
+    
+    def encode_with_texts(self, texts: List[str]) -> List[dict]:
+        """
+        Encode texts and return with original text
+        
+        Args:
+            texts: List of text strings
+            
+        Returns:
+            List of dicts with 'text' and 'embedding' keys
+        """
+        embeddings = self.encode_batch(texts)
+        return [
+            {
+                'text': text,
+                'embedding': emb
+            }
+            for text, emb in zip(texts, embeddings)
+        ]
+    
+    def similarity(self, embedding1: np.ndarray, embedding2: np.ndarray) -> float:
+        """
+        Calculate cosine similarity between two embeddings
+        
+        Args:
+            embedding1: First embedding vector
+            embedding2: Second embedding vector
+            
+        Returns:
+            float: Similarity score between -1 and 1
+        """
+        return float(np.dot(embedding1, embedding2))
+    
+    def get_dimension(self) -> int:
+        """Get embedding dimension"""
+        return self.dimension
+    
+    def get_model_name(self) -> str:
+        """Get model name"""
+        return self.model_name
+
+
+# Global instance
+embedding_service = EmbeddingService()
+
+//pdf_processor.py
+import pdfplumber
+import re
+from typing import List, Tuple, Optional, Dict, Set
+from dataclasses import dataclass, field
+from pathlib import Path
+import logging
+from functools import lru_cache
+import hashlib
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class DocumentSection:
+    """Represents a section of a document"""
+    name: str
+    text: str
+    page_start: int
+    page_end: int
+    level: int = 0  # 0 for main sections, 1 for subsections, etc.
+    section_id: Optional[str] = None  # e.g., "2.1", "3.2.1"
+
+
+@dataclass
+class Citation:
+    """Represents an extracted citation"""
+    text: str
+    line_number: int
+    page: int
+
+
+@dataclass
+class ProcessedDocument:
+    """Complete processed document with metadata"""
+    title: str
+    paper_name: str  # ✅ NEW: PDF filename as paper name
+    authors: List[str]
+    year: int
+    abstract: str
+    sections: List[DocumentSection]
+    total_pages: int
+    format_type: str  # "standard", "commentary", "report"
+    quality_metrics: Dict[str, float] = field(default_factory=dict)
+    citations: List[Citation] = field(default_factory=list)
+    keywords: List[str] = field(default_factory=list)
+
+
+class EnhancedTextCleaner:
+    """
+    Cleans extracted text for better quality
+    Handles: special characters, hyphenation, ligatures, multiple spaces
+    """
+    
+    # Common ligatures
+    LIGATURES = {
+        'ﬁ': 'fi',
+        'ﬂ': 'fl',
+        'ﬀ': 'ff',
+        'ﬃ': 'ffi',
+        'ﬄ': 'ffl',
+    }
+    
+    # Special dashes/hyphens
+    DASH_VARIANTS = {
+        '–': '-',  # en-dash
+        '—': '-',  # em-dash
+        '−': '-',  # minus
+    }
+    
+    @staticmethod
+    def clean_text(text: str) -> str:
+        """Multi-stage text cleaning"""
+        if not text:
+            return ""
+        
+        # Stage 1: Replace ligatures
+        for ligature, replacement in EnhancedTextCleaner.LIGATURES.items():
+            text = text.replace(ligature, replacement)
+        
+        # Stage 2: Normalize dashes
+        for dash, replacement in EnhancedTextCleaner.DASH_VARIANTS.items():
+            text = text.replace(dash, replacement)
+        
+        # Stage 3: Fix hyphenation (e.g., "opti-\nmization" → "optimization")
+        text = re.sub(r'(\w)-\s*\n\s*(\w)', r'\1\2', text)
+        
+        # Stage 4: Normalize whitespace (preserve paragraph breaks)
+        lines = text.split('\n')
+        lines = [' '.join(line.split()) for line in lines]
+        text = '\n'.join(lines)
+        
+        # Stage 5: Remove excessive blank lines
+        text = re.sub(r'\n\n+', '\n\n', text)
+        
+        # Stage 6: Fix common OCR errors
+        text = re.sub(r'(\d)\s+([ivxlcm])\b', r'\1\2', text)  # Fix spacing in Roman numerals
+        
+        return text
+    
+    @staticmethod
+    def preserve_lists(text: str) -> Tuple[str, List[str]]:
+        """Extract and preserve bullet points/lists"""
+        list_patterns = [
+            r'^\s*[•\-\*]\s+(.+)$',
+            r'^\s*\d+\.\s+(.+)$',
+            r'^\s*[a-z]\)\s+(.+)$',
+        ]
+        
+        lists = []
+        for pattern in list_patterns:
+            matches = re.findall(pattern, text, re.MULTILINE)
+            lists.extend(matches)
+        
+        return text, lists
+
+
+class AuthorExtractor:
+    """
+    Enhanced author extraction with name parsing
+    Handles: multiple formats, affiliations, et al., author lists
+    """
+    
+    @staticmethod
+    def extract_authors(text: str, max_authors: int = 10) -> List[str]:
+        """
+        Extract authors with improved heuristics
+        """
+        lines = text.split('\n')[:15]  # Check first 15 lines
+        
+        authors = []
+        
+        for line in lines:
+            stripped = line.strip()
+            
+            # Skip common non-author lines
+            if any(skip in stripped.lower() for skip in [
+                'abstract', 'introduction', 'http', 'email', '©', 'doi',
+                'corresponding', 'affiliation', 'department', 'university'
+            ]):
+                continue
+            
+            # Skip if too short or too long
+            if len(stripped) < 5 or len(stripped) > 200:
+                continue
+            
+            # Check if line looks like author (multiple capitalized words)
+            words = stripped.split()
+            capitalized = sum(1 for w in words if w and w[0].isupper())
+            
+            # Also check for common name patterns
+            has_comma = ',' in stripped
+            has_and = ' and ' in stripped.lower() or ' & ' in stripped
+            
+            if (capitalized >= 2 and len(words) >= 2) or has_comma or has_and:
+                # Split multiple authors if separated by "and" or "&"
+                author_list = re.split(r'\s+and\s+|\s+&\s+', stripped, flags=re.IGNORECASE)
+                
+                for author in author_list:
+                    author = author.strip()
+                    # Remove superscript numbers and affiliations
+                    author = re.sub(r'[¹²³⁴⁵⁶⁷⁸⁹⁰†‡*]+', '', author)
+                    author = re.sub(r'\s*\([^)]*\)', '', author)
+                    
+                    if len(author) > 2 and len(authors) < max_authors:
+                        authors.append(author)
+        
+        return list(dict.fromkeys(authors))[:max_authors]  # Remove duplicates
+
+
+class SectionHierarchyDetector:
+    """
+    Detects and maintains section hierarchy (main, sub, subsub)
+    """
+    
+    @staticmethod
+    def parse_section_id(header: str) -> Optional[str]:
+        """
+        Extract section numbering (e.g., "2.1" from "2.1 Related Work")
+        Returns: "2.1" or None
+        """
+        match = re.match(r'^(\d+(?:\.\d+)*)\s+', header)
+        return match.group(1) if match else None
+    
+    @staticmethod
+    def get_section_level(section_id: str) -> int:
+        """
+        Get hierarchy level from section ID
+        "1" → 0, "2.1" → 1, "3.2.1" → 2
+        """
+        if not section_id:
+            return 0
+        return section_id.count('.') 
+
+
+class PDFProcessorEnhanced:
+    """
+    Enhanced production-grade PDF processor for research papers
+    
+    Improvements:
+    - Better metadata extraction with author parsing
+    - Section hierarchy detection
+    - Text quality metrics
+    - Enhanced text cleaning
+    - Keywords extraction
+    - Citation detection
+    - Paper name from PDF filename
+    - Extraction quality assessment
+    """
+    
+    # ✅ EXPANDED SECTION PATTERNS
+    SECTION_PATTERNS = [
+        # Main sections - Abstract
+        r'^\s*(?:abstract|summary|executive\s*summary)\s*$',
+        
+        # Introduction variants
+        r'^\s*(?:introduction|overview|background|motivation|preliminaries)\s*$',
+        
+        # Related Work/Literature Review
+        r'^\s*(?:related\s*works?|literature\s*review|state\s*of\s*the\s*art|prior\s*work)\s*$',
+        
+        # Methodology/Methods/Approach
+        r'^\s*(?:methodology|methods?|approach|technical\s*approach|proposal|framework|design)\s*$',
+        
+        # Results/Experiments/Evaluation
+        r'^\s*(?:results?|experiments?|evaluation|findings|empirical\s*study|benchmarks?)\s*$',
+        
+        # Discussion/Analysis/Implications
+        r'^\s*(?:discussion|analysis|implications|findings|observations)\s*$',
+        
+        # Conclusion/Future Work
+        r'^\s*(?:conclusions?|future\s*work|limitations|summary|recommendations)\s*$',
+        
+        # References/Bibliography
+        r'^\s*(?:references|bibliography|works\s*cited|citations)\s*$',
+        
+        # Appendix/Supplementary
+        r'^\s*(?:appendix|supplementary|supplement|appendices|supplemental)\s*$',
+        r'^\s*appendix\s+[a-z]\s*:?\s*$',
+        
+        # Numbered sections (1., 1), 1:, etc.)
+        r'^\s*\d+\.?\s+[A-Z][\w\s&-]+$',
+        
+        # Nested sections (2.1, 3.2.1, etc.)
+        r'^\s*\d+\.\d+(?:\.\d+)?\s+[A-Z][\w\s&-]+$',
+        
+        # Section headers with ALL CAPS
+        r'^\s*[A-Z][A-Z\s]{5,}$',
+        
+        # Keywords, acknowledgments
+        r'^\s*(?:keywords?|acknowledgments?|authors?|contributors?)\s*$',
+    ]
+    
+    def __init__(self, enable_caching: bool = True):
+        self.section_regex = re.compile(
+            '|'.join(self.SECTION_PATTERNS),
+            re.IGNORECASE | re.MULTILINE
+        )
+        self.enable_caching = enable_caching
+        self._cache: Dict[str, ProcessedDocument] = {}
+        self.text_cleaner = EnhancedTextCleaner()
+        self.author_extractor = AuthorExtractor()
+        self.hierarchy_detector = SectionHierarchyDetector()
+    
+    def _get_file_hash(self, pdf_path: str) -> str:
+        """Generate hash of file for caching"""
+        return hashlib.md5(Path(pdf_path).read_bytes()).hexdigest()
+    
+    def extract_metadata(self, pdf_path: str) -> Tuple[str, List[str], int, List[str]]:
+        """
+        Extract title, authors, year, keywords from first page
+        
+        Returns: (title, authors, year, keywords)
+        """
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                first_page = pdf.pages[0].extract_text() or ""
+                lines = [l.strip() for l in first_page.split('\n') if l.strip()]
+                
+                if not lines:
+                    logger.warning(f"Empty first page in {pdf_path}")
+                    return "Unknown", [], 2024, []
+                
+                # ✅ Title: usually first substantial line
+                title = lines[0]
+                
+                # ✅ Enhanced author extraction
+                authors = self.author_extractor.extract_authors(first_page)
+                
+                # ✅ Year: search entire first page
+                year_match = re.search(r'\(?(19|20)\d{2}\)?', first_page)
+                year = int(year_match.group(1)) if year_match else 2024
+                
+                # ✅ Keywords: look for keywords section
+                keywords = []
+                keywords_match = re.search(
+                    r'(?:keywords?|key\s*terms?)\s*:?\s*([^\n]+)',
+                    first_page,
+                    re.IGNORECASE
+                )
+                if keywords_match:
+                    keywords_text = keywords_match.group(1)
+                    keywords = [k.strip() for k in keywords_text.split(',')][:10]
+                
+                return title, authors, year, keywords
+        
+        except Exception as e:
+            logger.error(f"Metadata extraction failed for {pdf_path}: {e}")
+            return "Unknown", [], 2024, []
+    
+    def extract_sections(self, pdf_path: str) -> Tuple[List[DocumentSection], str]:
+        """
+        Extract sections with hierarchy detection
+        Returns: (sections, format_type)
+        """
+        sections = []
+        current_section = None
+        current_text = []
+        current_page = 0
+        section_count = 0
+        
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                total_pages = len(pdf.pages)
+                
+                for page_num, page in enumerate(pdf.pages, start=1):
+                    text = page.extract_text() or ""
+                    
+                    # ✅ Clean extracted text
+                    text = self.text_cleaner.clean_text(text)
+                    lines = text.split('\n')
+                    
+                    for line in lines:
+                        if self.section_regex.search(line):
+                            # Save previous section
+                            if current_section and current_text:
+                                section_text = '\n'.join(current_text).strip()
+                                
+                                if len(section_text) > 20:
+                                    # ✅ Detect hierarchy level
+                                    section_id = self.hierarchy_detector.parse_section_id(current_section)
+                                    level = self.hierarchy_detector.get_section_level(section_id)
+                                    
+                                    sections.append(DocumentSection(
+                                        name=current_section,
+                                        text=section_text,
+                                        page_start=current_page,
+                                        page_end=page_num,
+                                        level=level,
+                                        section_id=section_id
+                                    ))
+                                    section_count += 1
+                            
+                            current_section = line.strip()
+                            current_text = []
+                            current_page = page_num
+                        
+                        elif current_section:
+                            stripped = line.strip()
+                            
+                            # ✅ Enhanced noise filtering
+                            if self._is_noise(stripped):
+                                continue
+                            
+                            current_text.append(stripped)
+        
+        except Exception as e:
+            logger.error(f"Section extraction failed for {pdf_path}: {e}")
+        
+        # Add final section
+        if current_section and current_text:
+            section_text = '\n'.join(current_text).strip()
+            if len(section_text) > 20:
+                section_id = self.hierarchy_detector.parse_section_id(current_section)
+                level = self.hierarchy_detector.get_section_level(section_id)
+                
+                sections.append(DocumentSection(
+                    name=current_section,
+                    text=section_text,
+                    page_start=current_page,
+                    page_end=total_pages,
+                    level=level,
+                    section_id=section_id
+                ))
+                section_count += 1
+        
+        # Determine format type
+        if section_count >= 5:
+            format_type = "standard"
+        elif section_count >= 2:
+            format_type = "report"
+        else:
+            format_type = "commentary"
+        
+        # Fallback for papers with no formal sections
+        if not sections:
+            logger.warning(f"No standard sections in {pdf_path}. Using fallback.")
+            try:
+                with pdfplumber.open(pdf_path) as pdf:
+                    full_text = '\n'.join(
+                        (page.extract_text() or "") for page in pdf.pages
+                    )
+                    full_text = self.text_cleaner.clean_text(full_text)
+                    sections = [DocumentSection(
+                        name="Full Document",
+                        text=full_text,
+                        page_start=1,
+                        page_end=total_pages
+                    )]
+            except Exception as e:
+                logger.error(f"Fallback extraction failed: {e}")
+        
+        return sections, format_type
+    
+    def _is_noise(self, line: str) -> str:
+        """Filter noise from extracted text"""
+        # Empty or too short
+        if not line or len(line) < 3:
+            return True
+        
+        # Page numbers
+        if re.match(r'^\d+$', line):
+            return True
+        
+        # Just symbols/dashes
+        if re.match(r'^[-\s\d.(),|]+$', line):
+            return True
+        
+        # Common footer/header patterns
+        if any(footer in line.lower() for footer in [
+            'page', 'copyright', 'all rights', 'doi:', 'arxiv', 'proceedings'
+        ]):
+            return True
+        
+        return False
+    
+    def extract_citations(self, sections: List[DocumentSection]) -> List[Citation]:
+        """
+        Extract potential citations from References section
+        """
+        citations = []
+        
+        for section in sections:
+            if 'reference' not in section.name.lower():
+                continue
+            
+            lines = section.text.split('\n')
+            for i, line in enumerate(lines):
+                # Simple citation pattern: starts with [number] or number.
+                if re.match(r'^\s*\[\d+\]|\d+\.\s', line.strip()):
+                    citations.append(Citation(
+                        text=line.strip(),
+                        line_number=i,
+                        page=section.page_start
+                    ))
+        
+        return citations
+    
+    def calculate_quality_metrics(self, doc: ProcessedDocument) -> Dict[str, float]:
+        """
+        Calculate extraction quality metrics
+        """
+        metrics = {}
+        
+        # Metadata completeness (0-100)
+        completeness = 0
+        completeness += 25 if doc.title != "Unknown" else 0
+        completeness += 25 if len(doc.authors) > 0 else 0
+        completeness += 25 if doc.year != 2024 else 0
+        completeness += 25 if doc.abstract else 0
+        metrics['metadata_completeness'] = completeness
+        
+        # Section extraction quality (0-100)
+        section_quality = min(100, (len(doc.sections) / 7) * 100)
+        metrics['section_extraction_quality'] = section_quality
+        
+        # Content density (average chars per section)
+        if doc.sections:
+            avg_section_length = sum(len(s.text) for s in doc.sections) / len(doc.sections)
+            metrics['avg_section_length'] = avg_section_length
+        
+        # Format type confidence
+        format_scores = {
+            'standard': 95,
+            'report': 85,
+            'commentary': 70
+        }
+        metrics['format_confidence'] = format_scores.get(doc.format_type, 50)
+        
+        # Overall quality score
+        metrics['overall_quality'] = (
+            completeness * 0.3 +
+            section_quality * 0.4 +
+            metrics.get('format_confidence', 50) * 0.3
+        ) / 100
+        
+        return metrics
+    
+    def process_document(self, pdf_path: str) -> Optional[ProcessedDocument]:
+        """
+        Main processing pipeline
+        ✅ NEW: Includes paper_name from PDF filename
+        """
+        try:
+            # Check cache
+            file_hash = self._get_file_hash(pdf_path) if self.enable_caching else None
+            if file_hash and file_hash in self._cache:
+                logger.info(f"Returning cached result for {pdf_path}")
+                return self._cache[file_hash]
+            
+            # ✅ Extract paper name from filename
+            paper_name = Path(pdf_path).stem  # Filename without extension
+            
+            # Extract metadata
+            title, authors, year, keywords = self.extract_metadata(pdf_path)
+            
+            # Extract sections
+            sections, format_type = self.extract_sections(pdf_path)
+            
+            # Extract abstract
+            abstract = ""
+            for section in sections:
+                if 'abstract' in section.name.lower():
+                    abstract = section.text[:500]
+                    break
+            
+            # Extract citations
+            citations = self.extract_citations(sections)
+            
+            # Get total pages
+            with pdfplumber.open(pdf_path) as pdf:
+                total_pages = len(pdf.pages)
+            
+            # Create document
+            doc = ProcessedDocument(
+                title=title,
+                paper_name=paper_name,
+                authors=authors,
+                year=year,
+                abstract=abstract,
+                sections=sections,
+                total_pages=total_pages,
+                format_type=format_type,
+                citations=citations,
+                keywords=keywords
+            )
+            
+            # Calculate quality metrics
+            doc.quality_metrics = self.calculate_quality_metrics(doc)
+            
+            # Cache result
+            if file_hash:
+                self._cache[file_hash] = doc
+            
+            logger.info(
+                f"✅ Processed: {paper_name} | {title[:40]}... | "
+                f"Sections: {len(sections)} | Pages: {total_pages} | "
+                f"Quality: {doc.quality_metrics['overall_quality']:.2%}"
+            )
+            
+            return doc
+        
+        except Exception as e:
+            logger.error(f"Document processing failed for {pdf_path}: {e}")
+            return None
+    
+    def batch_process(self, pdf_paths: List[str]) -> List[ProcessedDocument]:
+        """Process multiple documents"""
+        results = []
+        for pdf_path in pdf_paths:
+            doc = self.process_document(pdf_path)
+            if doc:
+                results.append(doc)
+        return results
+
+
+# ✅ Global instance for easy import
+pdf_processor = PDFProcessorEnhanced()
+
+//qdrant_service.py
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct
+from typing import List, Dict, Optional
+import uuid
+import logging
+from src.config import settings
+
+logger = logging.getLogger(__name__)
+
+class QdrantService:
+    """Qdrant vector database service"""
+    
+    COLLECTION_NAME = settings.QDRANT_COLLECTION
+    
+    def __init__(self, host: str = settings.QDRANT_HOST, port: int = settings.QDRANT_PORT, dimension: int = settings.EMBEDDING_DIMENSION):
+        try:
+            self.client = QdrantClient(host=host, port=port)
+            self.dimension = dimension
+            self.ensure_collection()
+            logger.info(f"✅ Connected to Qdrant at {host}:{port}")
+        except Exception as e:
+            logger.error(f"Failed to connect to Qdrant: {e}")
+            raise
+    
+    def ensure_collection(self):
+        """Create collection if it doesn't exist"""
+        try:
+            collections = self.client.get_collections().collections
+            if not any(c.name == self.COLLECTION_NAME for c in collections):
+                self.client.create_collection(
+                    collection_name=self.COLLECTION_NAME,
+                    vectors_config=VectorParams(
+                        size=self.dimension,
+                        distance=Distance.COSINE
+                    )
+                )
+                logger.info(f"✅ Created Qdrant collection: {self.COLLECTION_NAME}")
+        except Exception as e:
+            logger.error(f"Collection creation failed: {e}")
+    
+    def upsert_chunks(self, 
+                     chunks: List[Dict], 
+                     embeddings: List, 
+                     paper_id: int) -> List[str]:
+        """Store chunk vectors in Qdrant"""
+        try:
+            points = []
+            vector_ids = []
+            
+            for chunk, embedding in zip(chunks, embeddings):
+                point_id = str(uuid.uuid4())
+                
+                # ✅ Handle both numpy arrays and lists
+                if hasattr(embedding, 'tolist'):
+                    vector = embedding.tolist()
+                else:
+                    if isinstance(embedding, list) and len(embedding) > 0:
+                        if isinstance(embedding[0], list):
+                            vector = embedding[0]
+                        else:
+                            vector = embedding
+                    else:
+                        vector = embedding
+                
+                points.append(PointStruct(
+                    id=point_id,
+                    vector=vector,
+                    payload={
+                        'chunk_id': chunk['id'],
+                        'paper_id': paper_id,
+                        'text': chunk['text'],
+                        'section': chunk['section'],
+                        'page': chunk['page_number']
+                    }
+                ))
+                vector_ids.append(point_id)
+            
+            self.client.upsert(collection_name=self.COLLECTION_NAME, points=points)
+            logger.info(f"Upserted {len(points)} vectors for paper {paper_id}")
+            return vector_ids
+        
+        except Exception as e:
+            logger.error(f"Upsert failed: {e}")
+            raise
+    
+    def search(self, 
+              query_vector: List[float], 
+              top_k: int = 5,
+              paper_ids: Optional[List[int]] = None) -> List[Dict]:
+        """Search similar vectors"""
+        try:
+            results = self.client.search(
+                collection_name=self.COLLECTION_NAME,
+                query_vector=query_vector,
+                limit=top_k
+            )
+            
+            return [
+                {
+                    'chunk_id': r.payload['chunk_id'],
+                    'paper_id': r.payload['paper_id'],
+                    'text': r.payload['text'],
+                    'section': r.payload['section'],
+                    'page': r.payload['page'],
+                    'score': r.score
+                }
+                for r in results
+            ]
+        
+        except Exception as e:
+            logger.error(f"Search failed: {e}")
+            raise
+    
+    def delete_by_paper(self, paper_id: int):
+        """Delete all vectors for a paper"""
+        try:
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+            self.client.delete(
+                collection_name=self.COLLECTION_NAME,
+                points_selector=Filter(
+                    must=[FieldCondition(
+                        key="paper_id",
+                        match=MatchValue(value=paper_id)
+                    )]
+                )
+            )
+            logger.info(f"Deleted vectors for paper {paper_id}")
+        except Exception as e:
+            logger.error(f"Delete failed: {e}")
+
+
+# ✅ Global instance for easy import (uses env via settings)
+qdrant_service = QdrantService()
+
+
+//rag_pipeline.py
+import ollama
+from typing import List, Dict, Optional
+import time
+from src.models.database import Paper
+
+
+class RAGPipeline:
+    def __init__(self, qdrant_service, embedding_service, db_session, 
+                 model: str = "deepseek-r1:8b"):
+        self.qdrant = qdrant_service
+        self.embedder = embedding_service
+        self.db = db_session
+        self.model = model
+    
+    def generate_answer(self, question: str, top_k: int = 5, 
+                       paper_ids: Optional[List[int]] = None) -> Dict:
+        """Main RAG pipeline with paper_name tracking"""
+        start_time = time.time()
+        
+        # 1. Encode query
+        query_vector = self.embedder.encode_single(question)
+        
+        # 2. Retrieve relevant chunks
+        search_results = self.qdrant.search(
+            query_vector=query_vector.tolist(),
+            top_k=top_k,
+            paper_ids=paper_ids
+        )
+        
+        if not search_results:
+            return {
+                'answer': "No relevant information found in the papers.",
+                'citations': [],
+                'sources_used': [],
+                'confidence': 0.0,
+                'response_time': time.time() - start_time
+            }
+        
+        # 3. Build context
+        context_parts = []
+        for i, result in enumerate(search_results, 1):
+            paper = self.db.query(Paper).filter(Paper.id == result['paper_id']).first()
+            # ✅ INCLUDE PAPER_NAME IN CONTEXT
+            context_parts.append(
+                f"[Source {i}] From '{paper.title}' (paper_name: {paper.paper_name}), {result['section']} (Page {result['page']}):\n"
+                f"{result['text']}\n"
+            )
+        
+        context = "\n".join(context_parts)
+        
+        # 4. Generate answer with LLM
+        prompt = f"""You are a research assistant helping analyze academic papers.
+
+
+Context from research papers:
+{context}
+
+
+Question: {question}
+
+
+Instructions:
+- Provide a clear, accurate answer based ONLY on the context provided
+- Cite specific sources using [Source N] notation
+- If the context doesn't fully answer the question, acknowledge what's missing
+- Be concise but comprehensive
+
+
+Answer:"""
+        
+        response = ollama.chat(
+            model=self.model,
+            messages=[{'role': 'user', 'content': prompt}]
+        )
+        
+        answer = response['message']['content']
+        
+        # 5. Build citations with paper_name
+        citations = []
+        for result in search_results:
+            paper = self.db.query(Paper).filter(Paper.id == result['paper_id']).first()
+            citations.append({
+                'paper_title': paper.title,
+                'paper_name': paper.paper_name,  # ✅ ADD THIS
+                'section': result['section'],
+                'page': result['page'],
+                'relevance_score': round(result['score'], 3)
+            })
+        
+        # 6. Calculate confidence (average of top 3 scores)
+        confidence = sum(r['score'] for r in search_results[:3]) / min(3, len(search_results))
+        
+        response_time = time.time() - start_time
+        
+        return {
+            'answer': answer,
+            'citations': citations,
+            'sources_used': list(set(c['paper_title'] for c in citations)),
+            'confidence': round(confidence, 2),
+            'response_time': round(response_time, 2)
+        }
+confif.py
+from pydantic_settings import BaseSettings
+import os
+
+class Settings(BaseSettings):
+    # Application
+    APP_NAME: str = "Research Paper RAG System"
+    APP_VERSION: str = "1.0.0"
+    DEBUG: bool = False
+    LOG_LEVEL: str = "INFO"
+    
+    # API
+    API_HOST: str = "0.0.0.0"
+    API_PORT: int = 8000
+    
+    # Database
+    DATABASE_URL: str = "postgresql://rag_user:rag_password@localhost:5432/rag_db"
+    DB_POOL_SIZE: int = 20
+    DB_MAX_OVERFLOW: int = 40
+    
+    # Qdrant
+    QDRANT_HOST: str = "localhost"
+    QDRANT_PORT: int = 6333
+    QDRANT_COLLECTION: str = "research_papers"
+    
+    # Redis
+    REDIS_HOST: str = "localhost"
+    REDIS_PORT: int = 6379
+    REDIS_DB: int = 0
+    CACHE_TTL: int = 3600
+    
+    # LLM
+    OLLAMA_HOST: str = "http://localhost:11434"
+    OLLAMA_MODEL: str = "deepseek-r1:8b"
+    LLM_TEMPERATURE: float = 0.7
+    LLM_MAX_TOKENS: int = 2048
+    
+    # Embeddings
+    EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
+    EMBEDDING_DIMENSION: int = 384
+    EMBEDDING_BATCH_SIZE: int = 32
+    
+    # Processing
+    CHUNK_SIZE: int = 512
+    CHUNK_OVERLAP: int = 50
+    MAX_UPLOAD_SIZE: int = 50
+    UPLOAD_DIR: str = "./uploads"
+    
+    API_WORKERS: int = 1
+    MAX_WORKERS: int = 1
+    QUERY_CACHE_ENABLED: bool = True
+
+    # Auth tokens (optional)
+    HUGGING_FACE_HUB_TOKEN: str | None = None
+
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
+
+settings = Settings()
+
+
